@@ -81,6 +81,7 @@ class blip3oMetaModel:
     
 
         if self.get_gen_vision_tower() is None:
+            print("get the pretrained gen vision tower")
             gen_vision_tower = build_gen_vision_tower(model_args)
 
             if fsdp is not None and len(fsdp) > 0:

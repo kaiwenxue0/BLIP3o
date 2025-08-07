@@ -90,10 +90,13 @@ and run the inference code
 
 ```Shell
 python inference.py  /HF_model/checkpoint/path/
+python inference.py  /home/xuekaiwen/.cache/huggingface/hub/models--BLIP3o--BLIP3o-Model-8B/snapshots/3c307c309d94a594efea23afc54ecebe82798b6a
+
+
 ```
 ## Training
 We include two scripts: **slurm.sh** for multi-node training on Slurm clusters, and **run.sh** for debugging.
-
+0.
 For both **slurm.sh** and **run.sh**, you need to import huggingface home **HF_HOME**, training data folder **IMG_FOLDER** and output model save folder **OUTPUT_FOLDER**. 
 
 For our open source model training, we combine the pretraining dataset, including [long caption](https://huggingface.co/datasets/BLIP3o/BLIP3o-Pretrain-Long-Caption), [short caption](https://huggingface.co/datasets/BLIP3o/BLIP3o-Pretrain-Short-Caption) and [JourneyDB](https://huggingface.co/datasets/BLIP3o/BLIP3o-Pretrain-JourneyDB). 

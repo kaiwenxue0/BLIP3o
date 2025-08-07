@@ -9,7 +9,8 @@ from einops import rearrange, repeat
 import logging
 
 from huggingface_hub import snapshot_download
-cache_dir = snapshot_download(repo_id="jiuhai/eva_clip_vision_tower")
+# cache_dir = snapshot_download(repo_id="jiuhai/eva_clip_vision_tower")
+cache_dir="/home/xuekaiwen/.cache/huggingface/hub/models--jiuhai--eva_clip_vision_tower/snapshots/d56fdd92bce281278e37fce27cf46c41f257c334"
 
 
 

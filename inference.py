@@ -58,9 +58,9 @@ pipe = DiffusionPipeline.from_pretrained(
    safety_checker=None
 )
 
-
-pipe.vae.to(f'cuda:{device_1}')
-pipe.unet.to(f'cuda:{device_1}')
+# torch.cuda.OutOfMemoryError: CUDA out of memory. 
+# pipe.vae.to(f'cuda:{device_1}')
+# pipe.unet.to(f'cuda:{device_1}')
 
 
 

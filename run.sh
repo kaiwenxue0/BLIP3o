@@ -1,16 +1,20 @@
 #!/bin/bash
 
-conda activate  blip3o
+conda activate py310
 
 
-export HF_HOME=/HF/Home/
-export OUTPUT_FOLDER=/Your/Model/Output/
-export IMG_FOLDER=/Your/Image/Folder
+export HF_HOME=/home/xuekaiwen/.cache/huggingface
+export OUTPUT_FOLDER=/home/xuekaiwen/nanoMDM/BLIP3o/output_train
+export IMG_FOLDER=/home/xuekaiwen/.cache/huggingface/hub/datasets--BLIP3o--BLIP3o-Pretrain-Long-Caption/snapshots/9c9686108de6074520f5d1c6a74e9b3c8aacd801
+export HF_ENDPOINT=https://hf-mirror.com
+export NCCL_P2P_DISABLE=1
+export NCCL_IB_DISABLE=1
+
 
 ## import journeyDB folder if you want to use journeyDB, and then you need to add a training argument below   --journeyDB_folder  ${journeyDB_folder}  \  The  journeyDB_folder needs to be the format like:  /fsx/sfr/data/jiuhai/hub/datasets--JourneyDB--JourneyDB/snapshots/e191aa61ca37e5e4418707ade4df5deb5c6d5d8f
-export journeyDB_folder=/Your/JourneyDB/Folder  
+# export journeyDB_folder=/Your/JourneyDB/Folder  
 
-torchrun --nproc_per_node=8 \
+torchrun --nproc_per_node=1 \
     blip3o/train/train_mem.py \
     --deepspeed ./deepspeed_scripts/zero1.json \
     --model_name_or_path Qwen/Qwen2.5-VL-7B-Instruct  \
@@ -26,7 +30,7 @@ torchrun --nproc_per_node=8 \
     --bf16 True \
     --output_dir ${OUTPUT_FOLDER} \
     --num_train_epochs 1 \
-    --per_device_train_batch_size 16 \
+    --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 4 \
     --gradient_accumulation_steps 1 \
     --eval_strategy "no" \
@@ -48,8 +52,7 @@ torchrun --nproc_per_node=8 \
     --n_query 64 \
     --n_und_query 0 \
     --report_to none \
-    --run_name blip3o_qwen_vl_7b
-
-
-
-
+    --run_name blip3o_qwen_vl_7b \
+    --bits 8 \
+    > train.log 2>&1
+    
