@@ -1,4 +1,5 @@
 import os
+import re
 import io
 import copy
 from dataclasses import dataclass, field
@@ -497,6 +498,15 @@ class LazySupervisedMixDataset(Dataset):
 
         ###################################### text to image ####################################### 
         data_files = glob.glob(os.path.join(self.data_args.image_folder, "*.tar"))
+        # 只保留编号 0–10 的文件，并按序号排序
+        pattern = re.compile(r"sa_(\d+)\.tar$")  
+        data_files = sorted(
+            [
+                f for f in data_files
+                if 0 <= int(pattern.search(os.path.basename(f)).group(1)) <= 10
+            ],
+            key=lambda x: int(pattern.search(os.path.basename(x)).group(1))
+        )
         ## text to image
         train_dataset = load_dataset("webdataset", data_files=data_files, split="train", cache_dir='/fsx/sfr/data/jiuhai/', num_proc=128)
         train_dataset = train_dataset.rename_column("jpg", "image")
