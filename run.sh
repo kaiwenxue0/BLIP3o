@@ -1,29 +1,46 @@
+# 在代码中替换路径
+# vim remote/BLIP3o/blip3o/model/multimodal_encoder/eva_clip/eva_vit.py
+# cache_dir = "/mnt/workspace/xuekaiwen/data/jiuhai/eva_clip_vision_tower"
+
+# 建议的本地可写路径
+mkdir -p /home/notebook/code/group/xuekaiwen/{runs,logs,tmp,.cache/huggingface/{hub,datasets,transformers},.cache/torch,wandb}
 #!/bin/bash
+
 
 conda activate py310
 
 
-export HF_HOME=/home/xuekaiwen/.cache/huggingface
-export OUTPUT_FOLDER=/home/xuekaiwen/nanoMDM/BLIP3o/output_train
-export IMG_FOLDER=/home/xuekaiwen/.cache/huggingface/hub/datasets--BLIP3o--BLIP3o-Pretrain-Long-Caption/snapshots/9c9686108de6074520f5d1c6a74e9b3c8aacd801
+
+#  (qwen 3 8B + siglip2 428M + mlp2x_gelu projector 6.56M) + (evaclip 4.35B + sdxl 2.6B + vae 80M + dit 1.36B)
+export OUTPUT_FOLDER=/home/notebook/code/group/xuekaiwen/mask_diffusion/nanoMDM/remote/BLIP3o/output_train
+export IMG_FOLDER=/mnt/workspace/xuekaiwen/data/BLIP3o/BLIP3o-Pretrain-Long-Caption
+export journeyDB_folder=/mnt/workspace/xuekaiwen/data/BLIP3o/BLIP3o-Pretrain-JourneyDB
+
+export model_name_or_path=/mnt/workspace/xuekaiwen/data/Qwen/Qwen3-1.7B
+export vision_tower=/mnt/workspace/xuekaiwen/data/google/siglip2-so400m-patch16-512
+export gen_vision_tower=eva-clip-E-14-plus
+
+export TORCH_HOME=/home/notebook/code/group/xuekaiwen/.cache/torch
+export WANDB_DIR=/home/notebook/code/group/xuekaiwen/wandb
+export WANDB_CACHE_DIR=/home/notebook/code/group/xuekaiwen/wandb
+export TMPDIR=/home/notebook/code/group/xuekaiwen/tmp
+export HF_HOME=/home/notebook/code/group/xuekaiwen/.cache/huggingface
+export HF_HUB_CACHE=$HF_HOME/hub
+export HF_DATASETS_CACHE=$HF_HOME/datasets
+export TRANSFORMERS_CACHE=$HF_HOME/transformers
 export HF_ENDPOINT=https://hf-mirror.com
-export NCCL_P2P_DISABLE=1
-export NCCL_IB_DISABLE=1
 
-
-## import journeyDB folder if you want to use journeyDB, and then you need to add a training argument below   --journeyDB_folder  ${journeyDB_folder}  \  The  journeyDB_folder needs to be the format like:  /fsx/sfr/data/jiuhai/hub/datasets--JourneyDB--JourneyDB/snapshots/e191aa61ca37e5e4418707ade4df5deb5c6d5d8f
-# export journeyDB_folder=/Your/JourneyDB/Folder  
-
-torchrun --nproc_per_node=1 \
+torchrun --nproc_per_node=8 \
     blip3o/train/train_mem.py \
     --deepspeed ./deepspeed_scripts/zero1.json \
-    --model_name_or_path Qwen/Qwen3-1.7B \
+    --model_name_or_path ${model_name_or_path} \
     --version qwen \
     --data_type "mix" \
     --image_folder ${IMG_FOLDER} \
-    --vision_tower google/siglip2-so400m-patch16-512 \
+    --journeyDB_folder  ${journeyDB_folder} \
+    --vision_tower ${vision_tower} \
     --freeze_backbone False \
-    --gen_vision_tower eva-clip-E-14-plus \
+    --gen_vision_tower ${gen_vision_tower} \
     --gen_projector_type mlp2x_gelu \
     --mm_projector_type mlp2x_gelu \
     --mm_vision_select_layer -2 \
@@ -54,8 +71,14 @@ torchrun --nproc_per_node=1 \
     --n_query 64 \
     --n_und_query 1024 \
     --report_to none \
-    --run_name blip3o_qwen3_siglip2
+    --run_name blip3o_qwen3_siglip2 \
+    > train.log 2>&1
 
 
+#add
+export IMAGE_CAHCE_DIR=/home/notebook/code/group/xuekaiwen/.cache/huggingface/datasets/webdataset/default-30dae044d7267163/0.0.0/8baf059d8b05687d95d8bae817c9fc387eb06339b6bf00740e46581c077c783e
 
+ --image_cache_dir ${IMAGE_CAHCE_DIR}
 
+#  (qwen 2.5 VL 7B Instruct) + (evaclip 4.35B + sdxl 2.6B + vae 80M + dit 1.36B)
+#

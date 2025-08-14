@@ -79,9 +79,11 @@ class DataArguments:
     lazy_preprocess: bool = False
     is_multimodal: bool = False
     image_folder: Optional[str] = field(default=None)
+    image_cache_dir: Optional[str] = field(default=None)
     shortcaption_image_folder: Optional[str] = field(default=None)
     data_type: Optional[str] = field(default="mix")
     image_aspect_ratio: str = "square"
+    journeyDB_folder: Optional[str] = field(default=None)
 
 
 @dataclass
@@ -499,16 +501,19 @@ class LazySupervisedMixDataset(Dataset):
         ###################################### text to image ####################################### 
         data_files = glob.glob(os.path.join(self.data_args.image_folder, "*.tar"))
         # 只保留编号 0–10 的文件，并按序号排序
-        pattern = re.compile(r"sa_(\d+)\.tar$")  
-        data_files = sorted(
-            [
-                f for f in data_files
-                if 0 <= int(pattern.search(os.path.basename(f)).group(1)) <= 10
-            ],
-            key=lambda x: int(pattern.search(os.path.basename(x)).group(1))
-        )
+        # pattern = re.compile(r"sa_(\d+)\.tar$")  
+        # data_files = sorted(
+        #     [
+        #         f for f in data_files
+        #         if 0 <= int(pattern.search(os.path.basename(f)).group(1)) <= 10
+        #     ],
+        #     key=lambda x: int(pattern.search(os.path.basename(x)).group(1))
+        # )
         ## text to image
-        train_dataset = load_dataset("webdataset", data_files=data_files, split="train", cache_dir='/fsx/sfr/data/jiuhai/', num_proc=128)
+        if self.data_args.image_cache_dir is None:
+            train_dataset = load_dataset("webdataset", data_files=data_files, split="train", num_proc=128)
+        else:
+            train_dataset = load_from_disk(self.data_args.image_cache_dir)
         train_dataset = train_dataset.rename_column("jpg", "image")
         train_dataset = train_dataset.add_column('type', len(train_dataset) * ['T2I'])
         train_dataset = train_dataset.add_column('image_path', len(train_dataset) * [None])
@@ -522,7 +527,10 @@ class LazySupervisedMixDataset(Dataset):
         ###################################### image to text ####################################### 
         data_files = glob.glob(os.path.join(self.data_args.image_folder, "*.tar"))
         ## text to image
-        train_dataset = load_dataset("webdataset", data_files=data_files, split="train", cache_dir='/fsx/sfr/data/jiuhai/', num_proc=128)
+        if self.data_args.image_cache_dir is None:
+            train_dataset = load_dataset("webdataset", data_files=data_files, split="train", num_proc=128)
+        else:
+            train_dataset = load_from_disk(self.data_args.image_cache_dir)
         train_dataset = train_dataset.rename_column("jpg", "image")
         train_dataset = train_dataset.add_column('type', len(train_dataset) * ['I2T'])
         train_dataset = train_dataset.add_column('image_path', len(train_dataset) * [None])
@@ -567,7 +575,6 @@ class LazySupervisedMixDataset(Dataset):
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
 
         while True:
-
             sources = self.list_data_dict[i]
 
             if sources["type"] == "T2I" or sources["type"] == "journeyDB_T2I":
@@ -677,6 +684,9 @@ class LazySupervisedMixDataset(Dataset):
                 sources, inst_type = preprocess_multimodal(copy.deepcopy([sources["conversations"]]), self.data_args)
             else:
                 sources = copy.deepcopy([sources["conversations"]])
+
+
+            
             data_dict = preprocess(sources, self.tokenizer, has_image=("image" in self.list_data_dict[i]))
             if isinstance(i, int):
                 data_dict = dict(input_ids=data_dict["input_ids"][0], labels=data_dict["labels"][0])
