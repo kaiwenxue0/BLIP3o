@@ -283,8 +283,6 @@ class blip3oMetaForCausalLM(ABC):
         latent_queries = latent_queries.contiguous().view(-1, H)
     
 
-
-
         # if not gen_images is None:
         #     prompt_image_embeds = gen_vision_tower(gen_images) # TODO: check dimension
         #     if 'early' in self.get_gen_pooling():
@@ -311,9 +309,12 @@ class blip3oMetaForCausalLM(ABC):
 
         if not und_images is None:
             und_image_embeds = vision_tower(und_images, grid_thw=grid_thw)
-            # _, c = und_image_embeds.shape
-            # batch_size = und_images.shape[0]
-            # und_image_embeds = und_image_embeds.view(batch_size, -1, c)
+            _, c = und_image_embeds.shape
+            batch_size = und_images.shape[0]
+            
+            # only for single input image per sample case
+            und_image_embeds = und_image_embeds.view(batch_size, -1, c)
+
             # und_image_embeds = und_image_embeds.contiguous().view(-1, c)
             # und_image_embeds = mm_projector(und_image_embeds)
 
@@ -327,7 +328,6 @@ class blip3oMetaForCausalLM(ABC):
         #     temp = temp.contiguous().view(-1, c)
         #     temp = mm_projector(temp) * 1e-20
         #     latent_queries += temp
-
 
 
 
@@ -360,7 +360,14 @@ class blip3oMetaForCausalLM(ABC):
      
 
         if not und_images is None:
-            text_embeds[und_img_idx] = und_image_embeds.to(text_embeds.device)[:und_img_idx.sum(), :]
+            B, L, D = text_embeds.shape
+            mask = und_img_idx.bool()
+
+            for b in range(B):
+                k = int(mask[b].sum().item())
+                # 保障右侧够用
+                assert und_image_embeds.size(1) >= k, f"sample {b}: need {k} embeds, got {und_image_embeds.size(1)}"
+                text_embeds[b, mask[b]] = und_image_embeds[b, :k, :].to(text_embeds.device)
 
         labels[image_idx] = -100
 
@@ -412,3 +419,5 @@ class blip3oMetaForCausalLM(ABC):
                     p.requires_grad = False
                 for p in self.get_output_embeddings().parameters():
                     p.requires_grad = False
+
+
