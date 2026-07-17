@@ -86,7 +86,7 @@ class LlavaHf(lmms):
             self.device_map = f"cuda:{accelerator.local_process_index}"
         else:
             self._device = torch.device(device)
-            self.device_map = device_map
+            self.device_map = device_map or str(self._device)
         if isinstance(dtype, str) and dtype != "auto":
             dtype = getattr(torch, dtype)
 

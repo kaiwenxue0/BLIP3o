@@ -16,7 +16,7 @@ Requires-Dist: black==24.1.0
 Requires-Dist: isort==5.13.2
 Requires-Dist: datasets==2.16.1
 Requires-Dist: evaluate>=0.4.0
-Requires-Dist: httpx==0.23.3
+Requires-Dist: httpx==0.24.0
 Requires-Dist: jsonlines
 Requires-Dist: numexpr
 Requires-Dist: numpy==1.26.4
@@ -80,7 +80,7 @@ Requires-Dist: Levenshtein; extra == "metrics"
 Provides-Extra: gemini
 Requires-Dist: google-generativeai; extra == "gemini"
 Provides-Extra: reka
-Requires-Dist: httpx==0.23.3; extra == "reka"
+Requires-Dist: httpx==0.24.0; extra == "reka"
 Requires-Dist: reka-api; extra == "reka"
 Provides-Extra: qwen
 Requires-Dist: decord; extra == "qwen"

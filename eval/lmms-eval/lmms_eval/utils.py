@@ -446,7 +446,11 @@ class Grouper:
 
 def make_table(result_dict, column: str = "results", sort_results: bool = False):
     """Generate table of results."""
-    from pytablewriter import LatexTableWriter, MarkdownTableWriter
+    try:
+        from pytablewriter import LatexTableWriter, MarkdownTableWriter
+    except ModuleNotFoundError:
+        LatexTableWriter = None
+        MarkdownTableWriter = None
 
     if column == "results":
         column_name = "Tasks"
@@ -464,11 +468,6 @@ def make_table(result_dict, column: str = "results", sort_results: bool = False)
         "",
         "Stderr",
     ]
-
-    md_writer = MarkdownTableWriter()
-    latex_writer = LatexTableWriter()
-    md_writer.headers = all_headers
-    latex_writer.headers = all_headers
 
     values = []
 
@@ -511,6 +510,24 @@ def make_table(result_dict, column: str = "results", sort_results: bool = False)
                 values.append([k, version, f, n, m, hib, v, "", ""])
             # k = ""
             # version = ""
+    if MarkdownTableWriter is None:
+        widths = [len(str(header)) for header in all_headers]
+        for row in values:
+            for idx, cell in enumerate(row):
+                widths[idx] = max(widths[idx], len(str(cell)))
+
+        def _format_row(row):
+            return "| " + " | ".join(str(cell).ljust(widths[idx]) for idx, cell in enumerate(row)) + " |"
+
+        divider = "| " + " | ".join("-" * width for width in widths) + " |"
+        lines = [_format_row(all_headers), divider]
+        lines.extend(_format_row(row) for row in values)
+        return "\n".join(lines)
+
+    md_writer = MarkdownTableWriter()
+    latex_writer = LatexTableWriter()
+    md_writer.headers = all_headers
+    latex_writer.headers = all_headers
     md_writer.value_matrix = values
     latex_writer.value_matrix = values
 

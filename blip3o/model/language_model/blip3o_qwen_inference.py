@@ -82,7 +82,7 @@ class blip3oQwenForInferenceLM(Qwen2_5_VLForConditionalGeneration, blip3oMetaFor
         text_embeds = torch.cat([text_embeds, latent_queries], dim=1)
         attention_mask = torch.cat([attention_mask, torch.ones_like(latent_queries[:, :, 0])], dim=1)
 
-
+        #TODO check the sequence dimention whether equals or not 
         outputs = self.model(
             inputs_embeds=text_embeds,
             attention_mask=attention_mask,

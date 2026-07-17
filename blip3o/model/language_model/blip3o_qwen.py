@@ -71,7 +71,10 @@ class blip3oQwenForCausalLM(Qwen2_5_VLForConditionalGeneration, blip3oMetaForCau
         grid_thw: Optional[torch.FloatTensor] = None,
         image_sizes: Optional[List[List[int]]] = None,
         return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None
+        cache_position: Optional[torch.LongTensor] = None,
+        image2sample: torch.Tensor = None,
+        patch_offsets: torch.Tensor = None,
+        sample_image_offsets: torch.Tensor = None
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -162,7 +165,7 @@ class blip3oQwenForCausalLM(Qwen2_5_VLForConditionalGeneration, blip3oMetaForCau
                 )
                 target = noise - latents
                 img_loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
-            print(f"img loss {img_loss}")
+            # print(f"img loss {img_loss}")
             total_loss = img_loss
 
         return CausalLMOutputWithPast(

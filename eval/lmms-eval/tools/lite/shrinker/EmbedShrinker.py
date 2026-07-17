@@ -51,5 +51,5 @@ class Embed_Shrinker(BaseShrinker):
         tiny_dataset = dataset.select(anchor_points)
 
         if self.push_to_hub:
-            tiny_dataset.push_to_hub(repo_id=f"lmms-lab/LMMs-Eval-Lite", config_name=self.task, split="lite")
+            tiny_dataset.push_to_hub(repo_id=f"/home/notebook/code/group/xuekaiwen/data/lmms-lab/LMMs-Eval-Lite", config_name=self.task, split="lite")
         return

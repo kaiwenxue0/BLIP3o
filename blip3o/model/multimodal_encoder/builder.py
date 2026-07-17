@@ -56,6 +56,8 @@ def build_dit(vision_tower_cfg, **kwargs):
             vision_tower_cfg.hidden_size = 2048
         elif "7B" in vision_tower_cfg.model_name_or_path:
             vision_tower_cfg.hidden_size = 3584
+        elif "LLaDA" in vision_tower_cfg.model_name_or_path:
+            vision_tower_cfg.hidden_size = 4096
 
     dit = NextDiTCrossAttn(NextDiTCrossAttnConfig(latent_embedding_size=vision_tower_cfg.hidden_size))
     noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained("Alpha-VLLM/Lumina-Next-SFT-diffusers", subfolder="scheduler")

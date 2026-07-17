@@ -3,23 +3,13 @@ import torch
 import torch.nn as nn
 from PIL import Image
 import torch.nn.functional as F
-
-
 import transformers
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.generation.utils import GenerateOutput
-
 from blip3o.model.blip3o_arch import blip3oMetaModelForLLaDA, blip3oMetaForLlavaLLaDAModelLM
-
-# from transformers import LlavaLLaDA_VLConfig, LlavaLLaDA_VLModel, LlavaLLaDA_VLForConditionalGeneration
 from llava.model import LlavaLLaDAConfig, LlavaLLaDAModel, LlavaLLaDAModelLM
-
-
-# TODO
 from blip3o.constants import UND_IMAGE_TOKEN_IDX
-
 
 
 from diffusers.utils.torch_utils import randn_tensor
@@ -29,9 +19,8 @@ from diffusers.models import AutoencoderKL
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 
 
-
 class blip3oLlavaLLaDAConfig(LlavaLLaDAConfig):
-    model_type = "blip3o_lladav"
+    model_type = "blip3o_lladav_inference"
 
 
 class blip3oLlavaLLaDAModel(blip3oMetaModelForLLaDA, LlavaLLaDAModel):
@@ -41,12 +30,12 @@ class blip3oLlavaLLaDAModel(blip3oMetaModelForLLaDA, LlavaLLaDAModel):
         super(blip3oLlavaLLaDAModel, self).__init__(config)
 
 
-class blip3oLlavaLLaDAModelLM(LlavaLLaDAModelLM, blip3oMetaForLlavaLLaDAModelLM):
+class blip3oLlavaLLaDAForInferenceLM(LlavaLLaDAModelLM, blip3oMetaForLlavaLLaDAModelLM):
     config_class = blip3oLlavaLLaDAConfig
 
     def __init__(self, config):
         LlavaLLaDAModelLM.__init__(self, config)
-        config.model_type = "blip3o_lladav"
+        config.model_type = "blip3o_lladav_inference"
 
         self.model = blip3oLlavaLLaDAModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -56,189 +45,6 @@ class blip3oLlavaLLaDAModelLM(LlavaLLaDAModelLM, blip3oMetaForLlavaLLaDAModelLM)
     def get_model(self):
         return self.model
 
-
-    def forward(
-        self,
-        input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        ids: Optional[list] = None,
-        i_s_pos: Optional[list] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        gen_image: Optional[torch.FloatTensor] = None,
-        und_image: Optional[torch.FloatTensor] = None,
-        grid_thw: Optional[torch.FloatTensor] = None,
-        image_sizes: Optional[List[List[int]]] = None,
-        return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        image2sample: torch.Tensor = None,
-        patch_offsets: torch.Tensor = None,
-        sample_image_offsets: torch.Tensor = None
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
-
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        if inputs_embeds is None and attention_mask is not None:
-            (
-                input_ids, 
-                position_ids, 
-                attention_mask, 
-                past_key_values,
-                inputs_embeds, 
-                labels, 
-                latents
-            ) = self.prepare_inputs_labels_for_multimodal_llada(
-                input_ids, 
-                position_ids, 
-                attention_mask, 
-                past_key_values, 
-                labels, 
-                gen_image, 
-                und_image,
-                grid_thw,
-                i_s_pos,
-                image_sizes=image_sizes)
-        elif inputs_embeds is None:
-            (
-                input_ids,
-                position_ids,
-                attention_mask,
-                past_key_values,
-                inputs_embeds,
-                labels,
-                latents
-            ) = self.prepare_inputs_labels_for_multimodal_llada(
-                input_ids,
-                position_ids,
-                attention_mask,
-                past_key_values,
-                labels,
-                gen_image,
-                und_image,
-                grid_thw,
-                i_s_pos,
-                image_sizes=image_sizes
-            )
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-        
-        hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states)
-        logits = logits.float()
-        
-        total_loss = None
-        if labels is not None:
-            # Shift so that tokens < n predict n
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = torch.nn.CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            shift_labels = shift_labels.view(-1)
-            # Enable model parallelism
-            shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
-
-
-            # compute image loss
-            # target_img_embeds = torch.clone(inputs_embeds.detach())[:,1:,:] # get target image emb
-            img_loss_funct = torch.nn.MSELoss()
-            # img_hidden_states = self.get_model().down_projector(hidden_states[:,-self.get_n_query():,:])
-            img_hidden_states = []
-            
-            for b in range(hidden_states.shape[0]):
-                img_hidden_states.append(hidden_states[b,i_s_pos[b]:i_s_pos[b]+64,:])
-            img_hidden_states = torch.stack(img_hidden_states,dim=0)
-            img_hidden_states = self.get_model().down_projector(img_hidden_states)
-            # img_loss = 0.0
-            if latents is None:
-                img_loss = img_loss_funct(img_hidden_states, torch.clone(img_hidden_states.detach()))
-            else:
-                bsz = latents.shape[0]
-                # device = latents.device
-                dtype = latents.dtype
-                noise = torch.randn_like(latents, device=latents.device)
-                u = torch.rand(size=(bsz,), device="cpu")
-                indices = (u * self.get_model().noise_scheduler.config.num_train_timesteps).long()
-                timesteps = self.get_model().noise_scheduler.timesteps[indices].to(device=latents.device)
-                sigmas = self.get_sigmas(timesteps, latents.device, n_dim=latents.ndim, dtype=dtype)
-                noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
-                noise_pred = self.get_model().dit(
-                    x=noisy_latents,
-                    timestep=timesteps,
-                    z_latents=self.mask_drop(img_hidden_states),
-                )
-                target = noise - latents
-                img_loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
-            # print(f"img loss {img_loss}")
-            total_loss = img_loss
-
-        return CausalLMOutputWithPast(
-            loss=total_loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
-        
-
-    @torch.no_grad()
-    def generate(
-        self,
-        inputs: Optional[torch.Tensor] = None,
-        images: Optional[torch.Tensor] = None,
-        image_sizes: Optional[torch.Tensor] = None,
-        **kwargs,
-    ) -> Union[GenerateOutput, torch.LongTensor]:
-        position_ids = kwargs.pop("position_ids", None)
-        attention_mask = kwargs.pop("attention_mask", None)
-        if "inputs_embeds" in kwargs:
-            raise NotImplementedError("`inputs_embeds` is not supported")
-
-        if images is not None:
-            (
-                inputs,
-                position_ids,
-                attention_mask,
-                _,
-                inputs_embeds,
-                img_indicator,
-                _
-            ) = self.prepare_inputs_labels_for_understanding(
-                inputs,
-                position_ids,
-                attention_mask,
-                None,
-                None,
-                images,
-                image_sizes=image_sizes
-            )
-        else:
-            inputs_embeds = self.get_model().embed_tokens(inputs)
-
-        return super().generate(
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            inputs_embeds=inputs_embeds,
-            **kwargs
-        )
 
     @torch.no_grad()
     def generate_image(
@@ -257,8 +63,12 @@ class blip3oLlavaLLaDAModelLM(LlavaLLaDAModelLM, blip3oMetaForLlavaLLaDAModelLM)
         inputs = tokenizer(text, padding="longest", return_tensors="pt")
         device = self.get_model().device
         attention_mask = inputs.attention_mask.to(device)
-        # TODO attention mask should be None?
+
+
         input_ids = inputs.input_ids.to(device)  # B x N
+        print("input_ids.shape:", input_ids.shape)
+        print("attention_mask.shape:", attention_mask.shape)
+        # TODO attention mask should be None?
         # change soi token id from 151665 to 126349  
         input_ids = torch.cat([input_ids, torch.tensor([[126349]]).to(device)], dim=1)
         # breakpoint()
@@ -276,9 +86,11 @@ class blip3oLlavaLLaDAModelLM(LlavaLLaDAModelLM, blip3oMetaForLlavaLLaDAModelLM)
 
 
         text_embeds = torch.cat([text_embeds, latent_queries], dim=1)
-        attention_mask = torch.cat([attention_mask, torch.ones_like(latent_queries[:, :, 0])], dim=1)
+        # attention_mask = torch.cat([attention_mask, torch.ones_like(latent_queries[:, :, 0])], dim=1)
+        attention_mask = None
 
-
+        print("text_embeds: ", text_embeds.shape)
+        print("attention_mask:", attention_mask.shape if attention_mask is not None else None)
         outputs = self.model(
             inputs_embeds=text_embeds,
             attention_mask=attention_mask,
@@ -335,6 +147,8 @@ class blip3oLlavaLLaDAModelLM(LlavaLLaDAModelLM, blip3oMetaForLlavaLLaDAModelLM)
                 latent_model_input = scheduler.scale_model_input(latent_model_input, t)
 
             # predict noise model_output
+            print("latent_model_input:", latent_model_input.shape)
+            print("img_hidden_states_input:", img_hidden_states_input.shape)
             noise_pred = self.get_model().dit(
                 x=latent_model_input,
                 timestep=t.unsqueeze(0).expand(latent_model_input.shape[0]).to(latent_model_input.device, torch.long),
@@ -443,5 +257,5 @@ class blip3oLlavaLLaDAModelLM(LlavaLLaDAModelLM, blip3oMetaForLlavaLLaDAModelLM)
             inputs['image_sizes'] = image_sizes
         return inputs
 
-AutoConfig.register("blip3o_lladav", blip3oLlavaLLaDAConfig)
-AutoModelForCausalLM.register(blip3oLlavaLLaDAConfig, blip3oLlavaLLaDAModelLM)
+AutoConfig.register("blip3o_lladav_inference", blip3oLlavaLLaDAConfig)
+AutoModelForCausalLM.register(blip3oLlavaLLaDAConfig, blip3oLlavaLLaDAForInferenceLM)

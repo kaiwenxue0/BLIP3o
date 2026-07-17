@@ -5,7 +5,7 @@ import shutil
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, BitsAndBytesConfig
 import torch
 from blip3o.model import *
-from blip3o.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+from blip3o.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN_LLADA, DEFAULT_IM_END_TOKEN_LLADA
 from blip3o.train.train import smart_tokenizer_and_embedding_resize
 
 
@@ -31,10 +31,14 @@ def load_pretrained_model(model_path, load_8bit=False, load_4bit=False, device_m
     if use_flash_attn:
         kwargs['attn_implementation'] = 'flash_attention_2'
 
-
-    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
-
-    model = blip3oQwenForInferenceLM.from_pretrained(model_path, low_cpu_mem_usage=True, torch_dtype=torch.float16).to('cuda:0')
+    if 'lladav' in model_path:
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+    if 'lladav' in model_path:
+        model = blip3oLlavaLLaDAForInferenceLM.from_pretrained(model_path, low_cpu_mem_usage=True, torch_dtype=torch.float16).to('cuda:0')
+    else:
+        model = blip3oQwenForInferenceLM.from_pretrained(model_path, low_cpu_mem_usage=True, torch_dtype=torch.float16).to('cuda:0')
 
     image_processor = None
     mm_use_im_start_end = getattr(model.config, "mm_use_im_start_end", False)
@@ -42,7 +46,11 @@ def load_pretrained_model(model_path, load_8bit=False, load_4bit=False, device_m
     if mm_use_im_patch_token:
         tokenizer.add_tokens([DEFAULT_IMAGE_PATCH_TOKEN], special_tokens=True)
     if mm_use_im_start_end:
-        tokenizer.add_tokens([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True)
+        if 'lladav' in model_path:
+            tokenizer.add_tokens([DEFAULT_IM_START_TOKEN_LLADA, DEFAULT_IM_END_TOKEN_LLADA], special_tokens=True)
+        else:
+            tokenizer.add_tokens([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True)
+
     model.resize_token_embeddings(len(tokenizer))
 
     if hasattr(model.config, "max_sequence_length"):

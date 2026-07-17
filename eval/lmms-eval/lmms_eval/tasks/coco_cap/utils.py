@@ -1,6 +1,8 @@
 import json
 import os
+import re
 from io import BytesIO
+from pathlib import Path
 
 import requests
 from loguru import logger as eval_logger
@@ -16,15 +18,54 @@ dir_name = os.path.dirname(os.path.abspath(__file__))
 COCO_METRICS = ["Bleu_4", "Bleu_3", "Bleu_2", "Bleu_1", "METEOR", "ROUGE_L", "CIDEr"]  # , "SPICE"]
 
 
+def _http_get_noenv(url: str, timeout: int = 30) -> bytes:
+    session = requests.Session()
+    session.trust_env = False
+    response = session.get(url, timeout=timeout)
+    response.raise_for_status()
+    return response.content
+
+
+def _load_visual_from_doc(doc):
+    if "image" in doc and doc["image"] is not None:
+        return doc["image"].convert("RGB")
+
+    filepath = doc.get("filepath")
+    if filepath:
+        candidate = Path(str(filepath)).expanduser()
+        if candidate.exists():
+            return Image.open(candidate).convert("RGB")
+
+    image_url = doc.get("url")
+    if image_url:
+        return Image.open(BytesIO(_http_get_noenv(image_url, timeout=30))).convert("RGB")
+
+    raise KeyError(f"Could not resolve image payload from COCO doc keys={sorted(doc.keys())}")
+
+
+def _simple_tokenize_caption(text: str) -> str:
+    lowered = str(text).lower().replace("\n", " ")
+    return " ".join(re.findall(r"[a-z0-9]+(?:'[a-z0-9]+)?", lowered))
+
+
+def _tokenize_captions(captions_for_image):
+    try:
+        tokenizer = PTBTokenizer()
+        return tokenizer.tokenize(captions_for_image)
+    except (FileNotFoundError, OSError) as exc:
+        eval_logger.warning(f"PTBTokenizer unavailable ({exc}). Falling back to simple Python tokenization.")
+        tokenized = {}
+        for image_id, captions in captions_for_image.items():
+            tokenized[image_id] = [_simple_tokenize_caption(caption["caption"]) for caption in captions]
+        return tokenized
+
+
 def coco_doc_to_visual(doc):
-    return [doc["image"].convert("RGB")]
+    return [_load_visual_from_doc(doc)]
 
 
 def coco_doc_to_visual_karpathy(doc):
-    image_url = doc["url"]
-    response = requests.get(image_url)
-    image = Image.open(BytesIO(response.content))
-    return [image.convert("RGB")]
+    return [_load_visual_from_doc(doc)]
 
 
 def coco_doc_to_text(doc):
@@ -70,8 +111,18 @@ def coco_process_result(doc, result):
 
 
 def coco_aggregation_result(results, metric, args):
-    scorers = [(Bleu(4), "Bleu_1"), (Bleu(4), "Bleu_2"), (Bleu(4), "Bleu_3"), (Bleu(4), "Bleu_4"), (Meteor(), "METEOR"), (Rouge(), "ROUGE_L"), (Cider(), "CIDEr")]  # , (Spice(), "SPICE")]
-    scorers_dict = {s[1]: s for s in scorers}
+    scorer_builders = {
+        "Bleu_1": lambda: (Bleu(4), "Bleu_1"),
+        "Bleu_2": lambda: (Bleu(4), "Bleu_2"),
+        "Bleu_3": lambda: (Bleu(4), "Bleu_3"),
+        "Bleu_4": lambda: (Bleu(4), "Bleu_4"),
+        "METEOR": lambda: (Meteor(), "METEOR"),
+        "ROUGE_L": lambda: (Rouge(), "ROUGE_L"),
+        "CIDEr": lambda: (Cider(), "CIDEr"),
+    }
+    if metric not in scorer_builders:
+        raise KeyError(f"Unsupported COCO caption metric: {metric}")
+    scorer, scorer_name = scorer_builders[metric]()
 
     stored_results = []
     # In order to make the coco eval tools to successfully create index
@@ -104,13 +155,12 @@ def coco_aggregation_result(results, metric, args):
         res[imgId] = coco_eval.cocoRes.imgToAnns[imgId]
 
     eval_logger.info("tokenization...")
-    tokenizer = PTBTokenizer()
-    gts = tokenizer.tokenize(gts)
-    res = tokenizer.tokenize(res)
+    gts = _tokenize_captions(gts)
+    res = _tokenize_captions(res)
 
     eval_logger.info(f"Computing {metric} scores...")
 
-    score, scores = scorers_dict[metric][0].compute_score(gts, res)
+    score, scores = scorer.compute_score(gts, res)
     # When metric is one of the Bleu, score will be a list
     if type(score) == list:
         n = int(metric.split("_")[-1])

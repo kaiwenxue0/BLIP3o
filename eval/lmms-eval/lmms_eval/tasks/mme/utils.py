@@ -2,6 +2,7 @@ import datetime
 import json
 import os
 from collections import defaultdict
+from math import floor
 
 from loguru import logger as eval_logger
 
@@ -32,6 +33,62 @@ eval_type_dict = {
 
 
 replace_prompt = " Please answer yes or no."
+
+
+def _stable_bucket_priority(name):
+    encoded = str(name).encode("utf-8")
+    return sum((index + 1) * byte for index, byte in enumerate(encoded))
+
+
+def mme_process_docs_fast280(dataset):
+    pairs_per_category = 10
+    row_by_index = {index: row for index, row in enumerate(dataset)}
+    category_to_pairs = defaultdict(dict)
+
+    for index, row in row_by_index.items():
+        category = str(row["category"])
+        question_id = row["question_id"]
+        category_to_pairs[category].setdefault(question_id, []).append(index)
+
+    selected_indices = []
+    for category in sorted(category_to_pairs):
+        question_ids = sorted(category_to_pairs[category], key=lambda item: str(item))
+        available_pairs = len(question_ids)
+        target_pairs = min(pairs_per_category, available_pairs)
+        if target_pairs <= 0:
+            continue
+
+        if target_pairs < available_pairs:
+            proportional_step = available_pairs / target_pairs
+            chosen_question_ids = []
+            used = set()
+            for sample_id in range(target_pairs):
+                candidate_position = min(available_pairs - 1, floor(sample_id * proportional_step))
+                while candidate_position in used and candidate_position + 1 < available_pairs:
+                    candidate_position += 1
+                used.add(candidate_position)
+                chosen_question_ids.append(question_ids[candidate_position])
+        else:
+            chosen_question_ids = question_ids
+
+        for question_id in chosen_question_ids:
+            indices = sorted(category_to_pairs[category][question_id])
+            if len(indices) != 2:
+                raise ValueError(
+                    f"MME fast subset requires pairwise rows, but category={category} question_id={question_id} "
+                    f"has {len(indices)} rows."
+                )
+            selected_indices.extend(indices)
+
+    selected_indices = sorted(selected_indices)
+    eval_logger.info(
+        "MME fast subset enabled: selected {} / {} examples ({} paired questions, up to {} pairs per category).",
+        len(selected_indices),
+        len(dataset),
+        len(selected_indices) // 2,
+        pairs_per_category,
+    )
+    return dataset.select(selected_indices)
 
 
 def mme_doc_to_visual(doc):
@@ -91,7 +148,11 @@ def mme_process_results(doc, results):
     key_name = "mme_perception_score" if category in eval_type_dict["Perception"] else "mme_cognition_score"
     # Note: the key name here is very important. It decides which aggregation function will receive the results
     # We note down the question id/category to help us aggregate the results later
-    return {key_name: {"question_id": doc["question_id"], "category": category, "score": score}}
+    payload = {"question_id": doc["question_id"], "category": category, "score": score}
+    return {
+        key_name: payload,
+        "mme_total_score": payload,
+    }
 
 
 def mme_aggregate_results(results):

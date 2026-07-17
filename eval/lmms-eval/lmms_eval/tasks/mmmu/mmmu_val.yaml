@@ -1,4 +1,4 @@
-dataset_path: lmms-lab/MMMU
+dataset_path: /home/notebook/code/group/xuekaiwen/data/lmms-lab/MMMU
 task: "mmmu_val"
 test_split: validation
 output_type: generate_until

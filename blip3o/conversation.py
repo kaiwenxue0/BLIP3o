@@ -1,9 +1,11 @@
 import dataclasses
 from enum import auto, Enum
-from typing import List, Tuple
+from typing import List, Any, Dict, Union, Tuple
+import re
 import base64
 from io import BytesIO
 from PIL import Image
+from transformers import AutoTokenizer
 
 
 class SeparatorStyle(Enum):
@@ -13,6 +15,7 @@ class SeparatorStyle(Enum):
     MPT = auto()
     PLAIN = auto()
     LLAMA_2 = auto()
+    LLAMA_3 = auto()
     CHATML = auto()
     QWEN = auto()
 
@@ -358,6 +361,26 @@ conv_blip3o_plain = Conversation(
     sep="\n",
 )
 
+conv_llada_plain = Conversation(
+    system="",
+    roles=("", ""),
+    messages=[],
+    version="llada_plain",
+    offset=0,
+    sep_style=SeparatorStyle.LLAMA_3,
+    sep="\n",
+)
+
+conv_llava_llada = Conversation(
+    system="You are a helpful language and vision assistant. " "You are able to understand the visual content that the user provides, " "and assist the user with a variety of tasks using natural language.",
+    roles=("user", "assistant"),
+    version="llava_llada",
+    messages=[],
+    offset=0,
+    sep="<|eot_id|>",
+    sep_style=SeparatorStyle.LLAMA_3,
+)
+
 conv_blip3o_v0 = Conversation(
     system="A chat between a curious human and an artificial intelligence assistant. "
            "The assistant gives helpful, detailed, and polite answers to the human's questions.",
@@ -459,6 +482,8 @@ conv_templates = {
     "vicuna_v1": conv_vicuna_v1,
     "llama_2": conv_llama_2,
     "mistral_instruct": conv_mistral_instruct,
+    "llada_plain": conv_llada_plain,
+    "llava_llada": conv_llava_llada,
     "chatml_direct": conv_chatml_direct,
     "mistral_direct": conv_chatml_direct,
 

@@ -2,7 +2,7 @@ import os
 import io
 import copy
 from dataclasses import dataclass, field
-import json
+import json, ast, itertools
 import logging
 import pathlib
 from typing import Dict, Optional, Sequence, List
@@ -18,14 +18,29 @@ from blip3o.train.blip3o_trainer import blip3oTrainer
 from blip3o import conversation as conversation_lib
 from blip3o.model import *
 from blip3o.mm_utils import tokenizer_image_token
-from PIL import Image, ImageFile
-from datasets import load_dataset, concatenate_datasets
+from PIL import Image, ImageFile, ImageDraw, ImageFont
+from datasets import load_dataset, load_from_disk, concatenate_datasets, Features, Value
+from datasets import Image as HFImage
+from datasets.features import Sequence as HFSeq, Image as HFFeatureImage
 from pathlib import Path
+from datetime import timedelta
+import re
 from datasets.utils.logging import set_verbosity_info
 from transformers import logging as tf_logging
 import torchvision.transforms as T
 from torchvision.transforms.functional import InterpolationMode
 from transformers import AutoProcessor
+from transformers import TrainerCallback, TrainingArguments
+from transformers.trainer_callback import PrinterCallback, ProgressCallback
+from transformers.trainer_utils import IntervalStrategy
+from datetime import datetime
+import torch.distributed as dist
+try:
+    from zoneinfo import ZoneInfo  # Py>=3.9
+except Exception:
+    ZoneInfo = None
+from io import BytesIO
+from PIL import Image as PILImage, ImageFile, UnidentifiedImageError
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 transform_und_images = T.Compose([T.Resize(448, interpolation=InterpolationMode.BICUBIC, antialias=True), T.CenterCrop(448)])
@@ -34,14 +49,51 @@ set_verbosity_info()
 tf_logging.set_verbosity_info()
 
 local_rank = None
-
-
+os.environ["ACCELERATE_TIMEOUT"] = "21600"    # Accelerate 初始化 PG 的超时
+os.environ["TORCHRUN_TIMEOUT"] = "21600"      # 一些环境会读取该值作为兜底（安全冗余）
 
 
 def rank0_print(*args):
     if local_rank == 0:
         print(*args)
 
+def robust_load_image(img_field):
+    """
+    支持几种输入形态：
+      - HF Image(decode=False) 给的 dict：{'bytes': b'...'} 或 {'path': '...'}
+      - bytes/bytearray
+      - str 路径
+      - 已经是 PIL.Image.Image（会直接转 RGB）
+    返回：PIL.Image (RGB)
+    """
+    def _open_pil_bytes(b: bytes):
+        im = PILImage.open(BytesIO(b))
+        return im.convert("RGB")
+
+    # 已是 PIL 图像
+    if hasattr(img_field, "convert") and hasattr(img_field, "size"):
+        return img_field.convert("RGB")
+
+    # HF dict
+    if isinstance(img_field, dict):
+        if img_field.get("bytes") is not None:
+            b = img_field["bytes"]
+            try:
+                return _open_pil_bytes(b)
+            except UnidentifiedImageError as e:
+                raise UnidentifiedImageError(f"PIL failed: {e}")
+        if img_field.get("path"):
+            return PILImage.open(img_field["path"]).convert("RGB")
+
+    # 原始字节
+    if isinstance(img_field, (bytes, bytearray)):
+        return _open_pil_bytes(bytes(img_field))
+
+    # 文件路径
+    if isinstance(img_field, str):
+        return PILImage.open(img_field).convert("RGB")
+
+    raise UnidentifiedImageError(f"Unknown image field type: {type(img_field)}")
 
 from packaging import version
 
@@ -78,7 +130,10 @@ class DataArguments:
     is_multimodal: bool = False
     image_folder: Optional[str] = field(default=None)
     journeyDB_folder: Optional[str] = field(default=None)
+    irecon_folder: Optional[str] = field(default=None)
     shortcaption_image_folder: Optional[str] = field(default=None)
+    video_icedit_folder: Optional[str] = field(default=None)
+    video_icgen_folder: Optional[str] = field(default=None)
     data_type: Optional[str] = field(default="mix")
     image_aspect_ratio: str = "square"
 
@@ -112,7 +167,59 @@ class TrainingArguments(transformers.TrainingArguments):
     mm_projector_lr: Optional[float] = None
     group_by_modality_length: bool = field(default=False)
 
+    logging_strategy: IntervalStrategy = field(default=IntervalStrategy.STEPS)
+    logging_steps: int = field(default=10)
+    logging_first_step: bool = field(default=True)
+    report_to: Optional[List[str]] = field(default_factory=list)  # 别用 [] 作为可变默认
+    disable_tqdm: bool = field(default=True)
 
+    ddp_timeout: int = 21600
+
+    # 关键：在这里统一“更稳”的分布式默认
+    def __post_init__(self):
+        super().__post_init__()
+        # 这些字段来自父类 transformers.TrainingArguments，这里只改默认值/下限，不重复声明字段
+        # if self.ddp_bucket_cap_mb is None:
+        #     self.ddp_bucket_cap_mb = 12                # 收小桶，避免一次超大 allreduce
+        # if self.ddp_broadcast_buffers is None:
+        #     self.ddp_broadcast_buffers = False         # 少同步 buffers，降通信噪声
+        # self.dataloader_drop_last = True               # 保证各 rank 步数一致
+        if self.ddp_timeout is None or self.ddp_timeout < 21600:
+            self.ddp_timeout = 21600                    # 进程组超时（秒）
+
+class StdoutLogCallback(TrainerCallback):
+    def __init__(self, tz: str | None = None,
+                 datefmt: str = "%Y-%m-%d %H:%M:%S %Z%z"):
+        """
+        tz: 例如 'Asia/Taipei'；None 则用系统本地时区
+        datefmt: 时间格式，默认带时区名与偏移
+        """
+        self.tz = tz
+        self.datefmt = datefmt
+
+    def _now_str(self) -> str:
+        if self.tz and ZoneInfo is not None:
+            try:
+                return datetime.now(ZoneInfo(self.tz)).strftime(self.datefmt)
+            except Exception:
+                pass
+        # 回退到系统本地时区
+        return datetime.now().astimezone().strftime(self.datefmt)
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not state.is_world_process_zero or not logs:
+            return
+        ts    = self._now_str()
+        step  = state.global_step
+        loss  = logs.get("loss")
+        lr    = logs.get("learning_rate")
+        epoch = logs.get("epoch")
+
+        parts = [f"[{ts}] [train] step={step}"]
+        if epoch is not None: parts.append(f"epoch={epoch:.2f}" if isinstance(epoch, float) else f"epoch={epoch}")
+        if loss  is not None: parts.append(f"loss={float(loss):.6f}")
+        if lr    is not None: parts.append(f"lr={float(lr):.6g}")
+        print("  ".join(parts), flush=True)
 def maybe_zero_3(param, ignore_status=False, name=None):
     from deepspeed import zero
     from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
@@ -188,6 +295,14 @@ def find_all_linear_names(model):
     if "lm_head" in lora_module_names:  # needed for 16-bit
         lora_module_names.remove("lm_head")
     return list(lora_module_names)
+
+def safe_stub(text: str, max_len=64):
+    """把说明文字清洗为文件名安全片段"""
+    text = (text or "").strip().replace("\n", " ")
+    text = re.sub(r"\s+", " ", text)       # 合并空白
+    text = text[:max_len]                   # 截断
+    text = re.sub(r'[^A-Za-z0-9._-]+', '_', text)  # 非安全字符替换为下划线
+    return text
 
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str, vision_tower: str):
@@ -329,16 +444,14 @@ def preprocess_multimodal(sources: Sequence[str], data_args: DataArguments) -> D
     und_placeholder = "<|vision_start|>" + "<|image_pad|>" * data_args.n_und_query + "<|vision_end|>"
     gen_placeholder = ""
     # "[IMG]" + "<image>" * data_args.n_query + "[/IMG]"
-    inst_type = None
+
     for source in sources:  # [instance]
         for sentence in source:
             if sentence["from"] == "human" and "<image>" in sentence["value"]:
                 sentence["value"] = sentence["value"].replace(DEFAULT_IMAGE_TOKEN, und_placeholder).strip()
-                inst_type = "und"
             elif sentence["from"] == "gpt" and "<image>" in sentence["value"]:
                 sentence["value"] = sentence["value"].replace(DEFAULT_IMAGE_TOKEN, gen_placeholder).strip()
-                inst_type = "gen"
-    return sources, inst_type
+    return sources
 
 
 
@@ -552,7 +665,49 @@ def preprocess(
 
     return dict(input_ids=input_ids, labels=targets)
 
+def count_inputs_fixed(ex):
+    names = ["image", "image1", "image2"]
+    return sum(ex.get(n) is not None for n in names)
 
+def parse_json_field(j):
+    """把 sources['json'] 统一转成 dict；支持 dict/str/bytes/file-like。
+       先按 JSON 解析，失败再 literal_eval。"""
+    if j is None:
+        return {}
+    # str: 先 JSON，再 literal_eval 兜底
+    if isinstance(j, str):
+        s = j.lstrip("\ufeff").strip()  # 去 BOM/空白
+        try:
+            return json.loads(s)
+        except json.JSONDecodeError:
+            try:
+                obj = ast.literal_eval(s)
+                return obj if isinstance(obj, dict) else {}
+            except Exception:
+                # 给调试用的上下文片段（可选）
+                # print("Bad json snippet:", repr(s[:200]))
+                return {}
+    # file-like
+    if hasattr(j, "read"):
+        try:
+            return json.load(j)
+        except Exception:
+            j = j.read()
+    # bytes -> str
+    if isinstance(j, (bytes, bytearray, memoryview)):
+        j = bytes(j).decode("utf-8", errors="ignore")
+    # 已是 dict
+    if isinstance(j, dict):
+        return j
+    # 其他类型，尽量转成 str 再试
+    try:
+        return json.loads(str(j))
+    except Exception:
+        try:
+            obj = ast.literal_eval(str(j))
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            return {}
 
 class LazySupervisedMixDataset(Dataset):
     """Dataset for supervised fine-tuning."""
@@ -581,19 +736,108 @@ class LazySupervisedMixDataset(Dataset):
         #         ["txt", "image", "type", "image_path"])])
         #     print(f"finish loading journeyDB {len(train_dataset)}")
         
+        def build_ds(data_files, num_proc=128, cache_dir=None):
+            kwargs = dict(path="webdataset", data_files=data_files, split="train", cache_dir=cache_dir)
 
+            # 判定 rank0（优先用已初始化的 dist.get_rank()，否则退回环境变量）
+            if int(os.environ.get("RANK", "0")) == 0:
+                _ = load_dataset(**kwargs, num_proc=num_proc)  # 仅 rank0 预构建/写缓存
+
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                dist.barrier()
+
+            ds = load_dataset(**kwargs, num_proc=num_proc)
+            return ds
+        
 
         ###################################### text to image ####################################### 
-        data_files = glob.glob(os.path.join(self.data_args.image_folder, "*.tar"))
-        ## text to image
-        train_dataset = load_dataset("webdataset", data_files=data_files, split="train", num_proc=128)
-        train_dataset = train_dataset.rename_column("jpg", "image")
-        train_dataset = train_dataset.add_column('type', len(train_dataset) * ['T2I'])
-        train_dataset = train_dataset.add_column('image_path', len(train_dataset) * [None])
-        train_dataset = train_dataset.remove_columns([col for col in train_dataset.column_names if not col in (
-            ["image", "txt", "type", "image_path"])])
-        print(f"finish loading image {len(train_dataset)}")
-        list_data_dict.append(train_dataset)
+        if self.data_args.image_folder is not None:
+            data_files = sorted(glob.glob(os.path.join(self.data_args.image_folder, "*.tar")))
+            if "BLIP3o-60k" in self.data_args.image_folder:
+                train_dataset = build_ds(data_files, num_proc=32)
+                train_dataset = train_dataset.rename_column("jpg", "image")
+                train_dataset = train_dataset.add_column('type', len(train_dataset) * ['T2I'])
+                train_dataset = train_dataset.rename_column('__url__', 'image_path')
+                # train_dataset = train_dataset.remove_columns([col for col in train_dataset.column_names if not col in (
+                #     ["image", "txt", "type", "image_path"])])
+            else:
+                train_dataset = load_dataset("webdataset", data_files=data_files, split="train", num_proc=128)
+                train_dataset = train_dataset.rename_column("jpg", "image")
+                train_dataset = train_dataset.add_column('type', len(train_dataset) * ['T2I'])
+                train_dataset = train_dataset.add_column('image_path', len(train_dataset) * [None])
+                # train_dataset = train_dataset.remove_columns([col for col in train_dataset.column_names if not col in (
+                #     ["image", "txt", "type", "image_path"])])
+            print(f"finish loading image from {self.data_args.image_folder}, number of images:{len(train_dataset)}")
+            list_data_dict.append(train_dataset)
+
+        ###################################### image reconstruction ####################################### 
+        if self.data_args.irecon_folder is not None:
+            data_files = sorted(glob.glob(os.path.join(self.data_args.irecon_folder, "*.tar")))
+            train_dataset = build_ds(data_files, num_proc=128)
+            print("train_dataset: ", train_dataset)
+            train_dataset = train_dataset.add_column('type', len(train_dataset) * ['I2I'])
+            train_dataset = train_dataset.rename_column("__key__", "id")
+            train_dataset = train_dataset.rename_column('__url__', 'image_path')
+            train_dataset = train_dataset.rename_column("jpg", "image")
+            print("train_dataset: ", train_dataset)
+            print(f"finish loading image from {self.data_args.irecon_folder}, number of images:{len(train_dataset)}")
+            
+            # ---- 在数据集构造完成后执行一次 ----
+            def _disable_hf_decode(ds):
+                feat = ds.features.get("image", None)
+                try:
+                    if isinstance(feat, HFSeq) and isinstance(feat.feature, HFFeatureImage):
+                        ds = ds.cast_column("image", HFSeq(HFImage(decode=False)))
+                    elif isinstance(feat, HFFeatureImage):
+                        ds = ds.cast_column("image", HFImage(decode=False))
+                except Exception as e:
+                    print(f"[WARN] cast_column('image', decode=False) 失败：{e}")
+                return ds
+            
+            train_dataset = _disable_hf_decode(train_dataset)
+
+            list_data_dict.append(train_dataset)
+        
+        ###################################### text and image to image (video in context edit)  ####################################### 
+        if self.data_args.video_icedit_folder is not None:
+
+            data_files = sorted(glob.glob(os.path.join(self.data_args.video_icedit_folder, "*.tar")))
+            train_dataset = build_ds(data_files, num_proc=128)
+            train_dataset = train_dataset.add_column('type', len(train_dataset) * ['TI2I'])
+            train_dataset = train_dataset.rename_column("__key__", "id")
+            train_dataset = train_dataset.rename_column("in0.png", "image")
+            train_dataset = train_dataset.rename_column("out.png", "output_image")
+            train_dataset = train_dataset.remove_columns([col for col in train_dataset.column_names if not col in (
+                ['id', 'type', 'image', 'output_image', 'json'])])
+                
+            list_data_dict.append(train_dataset)
+
+        ###################################### text and images to image (video in context generation)  ####################################### 
+        if self.data_args.video_icgen_folder is not None:
+            data_files = sorted(glob.glob(os.path.join(self.data_args.video_icgen_folder, "*.tar")))
+
+            features = Features({
+                "__key__": str,
+                "input_images.000.png": HFImage(),
+                "input_images.001.png": HFImage(),
+                "input_images.002.png": HFImage(),
+                "output_image.jpg": HFImage(),
+                "json": Value("string"),  
+                "__key__": Value("string"),  
+            })
+            train_dataset = load_dataset("webdataset", data_files=data_files, split="train", features=features, num_proc=128)
+            # TODO modify the dict format
+            train_dataset = train_dataset.add_column('type', len(train_dataset) * ['TII2I'])
+            train_dataset = train_dataset.rename_column("__key__", "id")
+            train_dataset = train_dataset.rename_column("input_images.000.png", "image")
+            train_dataset = train_dataset.rename_column("input_images.001.png", "image1")
+            train_dataset = train_dataset.rename_column("input_images.002.png", "image2")
+            train_dataset = train_dataset.rename_column("output_image.jpg", "output_image")
+            train_dataset = train_dataset.remove_columns([col for col in train_dataset.column_names if not col in (
+                ['id', 'type', 'image', "image1", "image2", 'output_image', 'json'])])
+                
+            list_data_dict.append(train_dataset)
+
             
 
         if len(list_data_dict) > 1:
@@ -626,18 +870,18 @@ class LazySupervisedMixDataset(Dataset):
             length_list.append(cur_len)
         return length_list
 
+
+
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
 
         while True:
             sources = self.list_data_dict[i]
-
+            json_info = parse_json_field(sources.get("json"))
             if sources["type"] == "T2I" or sources["type"] == "journeyDB_T2I":
                 sources["conversations"] = [
                     {"from": "human", "value": f"Please generate image based on the following caption: {sources['txt']}"},
                     {"from": "gpt", "value": "<image>"},
                 ]
-
-
             elif sources["type"] == "I2I" or sources["type"] == "journeyDB_I2I":
                 sources["conversations"] = [
                     {
@@ -646,11 +890,130 @@ class LazySupervisedMixDataset(Dataset):
                     },
                     {"from": "gpt", "value": ""},
                 ]
-
+            elif sources["type"] == "TI2I":
+                sources["conversations"] = [
+                    {
+                        "from": "human",
+                        "value": f"<image>\n{json_info['instruction']}",
+                    },
+                    {"from": "gpt", "value": "<image>"},
+                ]
+            elif sources["type"] == "TII2I":
+                
+                sources["conversations"] = [
+                    {
+                        "from": "human",
+                        "value": "<image>" * int(count_inputs_fixed(sources)) + f"\n{json_info['instruction']}",
+                    },
+                    {"from": "gpt", "value": "<image>"},
+                ]
             else:
                 raise ValueError("Unknown source type. Please check the 'type' in 'sources'.")
 
             if "image" in sources:
+                def _try_load_font(font_size: int):
+                    """尽量加载可显示中英文的字体；找不到就退回 PIL 默认字体。"""
+                    candidates = [
+                        "/home/notebook/code/group/xuekaiwen/.cache/geneval_panel/DejaVuSans.ttf",
+                    ]
+                    for p in candidates:
+                        try:
+                            if os.path.exists(p):
+                                return ImageFont.truetype(p, font_size)
+                        except Exception:
+                            pass
+                    return ImageFont.load_default()
+
+                def _render_caption_below(pil_img: Image.Image, caption: str,
+                                        font_size: int = 20, padding: int = 16,
+                                        text_color=(0, 0, 0), bg_color=(255, 255, 255)) -> Image.Image:
+                    """在图片下方加文字区并渲染 caption，返回新图。"""
+                    if not caption:
+                        return pil_img
+
+                    font = _try_load_font(font_size)
+                    W = pil_img.width
+                    # 先按像素宽度做逐字符/逐词换行（兼容中英文）
+                    draw = ImageDraw.Draw(pil_img)
+                    max_w = W - 2 * padding
+
+                    def wrap_by_pixels(text):
+                        lines, cur = [], ""
+                        for ch in text:
+                            test = cur + ch
+                            w = draw.textlength(test, font=font)
+                            if w <= max_w or cur == "":
+                                cur = test
+                            else:
+                                lines.append(cur)
+                                cur = ch
+                        if cur:
+                            lines.append(cur)
+                        return lines
+
+                    lines = []
+                    for seg in caption.split("\n"):
+                        lines.extend(wrap_by_pixels(seg))
+
+                    # 计算文字区高度
+                    ascent, descent = font.getmetrics() if hasattr(font, "getmetrics") else (font.size, 0)
+                    line_h = ascent + descent + 2  # 行距
+                    text_h = line_h * len(lines)
+                    H_new = pil_img.height + text_h + 2 * padding
+
+                    # 生成新画布并粘贴原图
+                    out = Image.new("RGB", (W, H_new), color=bg_color)
+                    out.paste(pil_img, (0, 0))
+                    draw = ImageDraw.Draw(out)
+
+                    # 文字起点
+                    y = pil_img.height + padding
+                    x = padding
+                    for line in lines:
+                        draw.text((x, y), line, fill=text_color, font=font)
+                        y += line_h
+
+                    return out
+
+                def _hstack_align_height(pils, gap, bg):
+                    """把多张 PIL 图按高度对齐后横向拼接成一张，返回拼好的 PIL。"""
+                    H = max(im.height for im in pils)
+                    resized = []
+                    for im in pils:
+                        if im.height != H:
+                            im = im.resize((int(im.width * H / im.height), H), Image.BICUBIC)
+                        resized.append(im)
+                    W = sum(im.width for im in resized) + gap * (len(resized) - 1)
+                    canvas = Image.new("RGB", (W, H), bg)
+                    x = 0
+                    for j, im in enumerate(resized):
+                        canvas.paste(im, (x, 0))
+                        x += im.width + (gap if j < len(resized) - 1 else 0)
+                    return canvas
+
+                def _prepare_save_images(raw_images, processor, image_aspect_ratio):
+                    """生成用于落盘的 PIL 列表：当 aspect_ratio='pad' 时，做与 img_process 一致的方形填充。"""
+                    out = []
+                    if image_aspect_ratio == "pad":
+                        def expand2square(pil_img, background_color):
+                            width, height = pil_img.size
+                            if width == height:
+                                return pil_img
+                            elif width > height:
+                                result = Image.new(pil_img.mode, (width, width), background_color)
+                                result.paste(pil_img, (0, (width - height) // 2))
+                                return result
+                            else:
+                                result = Image.new(pil_img.mode, (height, height), background_color)
+                                result.paste(pil_img, ((height - width) // 2, 0))
+                                return result
+                        bg = tuple(int(x * 255) for x in processor.image_mean)
+                        for img in raw_images:
+                            out.append(expand2square(img, bg).convert("RGB"))
+                    else:
+                        for img in raw_images:
+                            out.append(img.convert("RGB"))
+                    return out
 
                 def img_process(images, processor, image_aspect_ratio):
                     if image_aspect_ratio == "pad":
@@ -676,13 +1039,29 @@ class LazySupervisedMixDataset(Dataset):
 
                 if sources["type"] == "T2I" or sources["type"] == "I2I":
                     image_files = self.list_data_dict[i]["image"]
+                    output_image_files = []
+                elif sources["type"] == "TI2I":
+                    image_files = self.list_data_dict[i]["image"]
+                    output_image_files = self.list_data_dict[i]["output_image"]
+                elif sources["type"] == "TII2I":
+                    if self.list_data_dict[i]["image2"] is not None:
+                        image_files = [self.list_data_dict[i]["image"], self.list_data_dict[i]["image1"], self.list_data_dict[i]["image2"]]
+                    elif self.list_data_dict[i]["image1"] is not None:
+                        image_files = [self.list_data_dict[i]["image"], self.list_data_dict[i]["image1"]]
+                    else:
+                        image_files = self.list_data_dict[i]["image"]
+                    output_image_files = self.list_data_dict[i]["output_image"]
                 else:
                     image_files = self.list_data_dict[i]["image_path"]
+                    output_image_files = []
 
                 if not isinstance(image_files, list):
                     image_files = [image_files]
-
+                if not isinstance(output_image_files, list):
+                    output_image_files = [output_image_files]
+                    
                 images = []
+                output_images = []
 
                 def read_bin_as_bytesio(bin_file_path):
                     with open(bin_file_path, "rb") as f:
@@ -690,8 +1069,17 @@ class LazySupervisedMixDataset(Dataset):
 
                 for img in image_files:
                     try:
-                        if sources["type"] == "T2I" or sources["type"] == "I2I":
+                        if sources["type"] == "T2I" or sources["type"] == "TI2I" or sources["type"] == "TII2I":
                             img = img.convert("RGB")
+                        elif sources["type"] == "I2I":
+                            try:
+                                img = robust_load_image(img)   # 一定返回 RGB（或抛异常）
+                                # 如需额外保障，可再转一次（幂等）
+                                img = img.convert("RGB")
+                            except Exception as e:
+                                # 仅跳过这张，不让整个样本立刻报错
+                                print(f"[WARN] sample idx={i}, image failed to load: {e}")
+
                         elif sources["type"] == "journeyDB_T2I" or sources["type"] == "journeyDB_I2I":
                             if sources["type"] == "journeyDB_T2I" or sources["type"] == "journeyDB_I2I":
                                 image_path = os.path.join(args.journeyDB_folder, "data", "train", "imgs", img)
@@ -705,17 +1093,90 @@ class LazySupervisedMixDataset(Dataset):
                         images = None
                         break  # Skip to the next image if there's an error
 
+                for img in output_image_files:
+                    try:
+                        if sources["type"] == "TI2I" or sources["type"] == "TII2I":
+                            img = img.convert("RGB")
+                        output_images.append(img)
+                    except Exception as e:
+                        print(f"Error opening image {img}: {e}")
+                        output_images = None
+                        break  # Skip to the next image if there's an error
+
                 if not images is None:
                     try:
+                        # # --- DEBUG: 输入侧概览 ---
+                        # try:
+                        #     print(f"[debug][img] index={i}  images_in={len(images)}  aspect_ratio='{self.data_args.image_aspect_ratio}'")
+                        #     for k, im in enumerate(images[:8]):  # 避免刷屏，只看前 8 张
+                        #         mode = getattr(im, "mode", "?")
+                        #         size = getattr(im, "size", "?")
+                        #         print(f"  [debug][img] in[{k}] mode={mode} size={size}")
+                        # except Exception as _:
+                        #     pass
+                        # --- 调用原处理函数 ---
                         temp = img_process(
                             images,
                             self.data_args.gen_image_processor,
                             self.data_args.image_aspect_ratio,
                         )
+                        # # --- DEBUG: 输出侧概览（tensor/list 的形状/范围） ---
+                        # try:
+                        #     if isinstance(temp, torch.Tensor):
+                        #         t = temp
+                        #         tmin = float(t.min()) if t.numel() > 0 else float("nan")
+                        #         tmax = float(t.max()) if t.numel() > 0 else float("nan")
+                        #         tmean = float(t.mean()) if t.numel() > 0 else float("nan")
+                        #         print(f"[debug][img] pixel_values: shape={tuple(t.shape)} dtype={t.dtype} "
+                        #             f"min={tmin:.5f} max={tmax:.5f} mean={tmean:.5f}")
+                        #     elif isinstance(temp, list) and len(temp) > 0 and isinstance(temp[0], torch.Tensor):
+                        #         shapes = [tuple(x.shape) for x in temp[:8]]
+                        #         print(f"[debug][img] pixel_values(list): n={len(temp)} head_shapes={shapes}")
+                        #     else:
+                        #         print(f"[debug][img] pixel_values type={type(temp)}")
+                        # except Exception as _:
+                        #     pass
                     except Exception as e:
                         print(f"Error wrong number of channels: {e}")
                         images = None
 
+                if not output_images is None:
+                    try:
+                        # # --- DEBUG: 输入侧概览 ---
+                        # try:
+                        #     print(f"[debug][img] index={i}  images_in={len(images)}  aspect_ratio='{self.data_args.image_aspect_ratio}'")
+                        #     for k, im in enumerate(images[:8]):  # 避免刷屏，只看前 8 张
+                        #         mode = getattr(im, "mode", "?")
+                        #         size = getattr(im, "size", "?")
+                        #         print(f"  [debug][img] in[{k}] mode={mode} size={size}")
+                        # except Exception as _:
+                        #     pass
+                        # --- 调用原处理函数 ---
+                        temp = img_process(
+                            output_images,
+                            self.data_args.gen_image_processor,
+                            self.data_args.image_aspect_ratio,
+                        )
+                        # # --- DEBUG: 输出侧概览（tensor/list 的形状/范围） ---
+                        # try:
+                        #     if isinstance(temp, torch.Tensor):
+                        #         t = temp
+                        #         tmin = float(t.min()) if t.numel() > 0 else float("nan")
+                        #         tmax = float(t.max()) if t.numel() > 0 else float("nan")
+                        #         tmean = float(t.mean()) if t.numel() > 0 else float("nan")
+                        #         print(f"[debug][img] pixel_values: shape={tuple(t.shape)} dtype={t.dtype} "
+                        #             f"min={tmin:.5f} max={tmax:.5f} mean={tmean:.5f}")
+                        #     elif isinstance(temp, list) and len(temp) > 0 and isinstance(temp[0], torch.Tensor):
+                        #         shapes = [tuple(x.shape) for x in temp[:8]]
+                        #         print(f"[debug][img] pixel_values(list): n={len(temp)} head_shapes={shapes}")
+                        #     else:
+                        #         print(f"[debug][img] pixel_values type={type(temp)}")
+                        # except Exception as _:
+                        #     pass
+                    except Exception as e:
+                        print(f"Error wrong number of channels: {e}")
+                        output_images = None
+                    
 
                 # If no valid images were found, randomly pick another item
                 if images is None:
@@ -724,24 +1185,51 @@ class LazySupervisedMixDataset(Dataset):
                     i = random.randint(0, len(self.list_data_dict) - 1)
                     continue
 
+                if output_images is None and (sources["type"] == "TI2I" or sources["type"] == "TI2I"):
+                    print(sources)
+                    print(f"warning false output image!!!!!!")
+                    i = random.randint(0, len(self.list_data_dict) - 1)
+                    continue
 
-                sources, inst_type = preprocess_multimodal(copy.deepcopy([sources["conversations"]]), self.data_args)
+                sources = preprocess_multimodal(copy.deepcopy([sources["conversations"]]), self.data_args)
             else:
                 sources = copy.deepcopy([sources["conversations"]])
+
             data_dict = preprocess(sources, self.tokenizer, has_image=("image" in self.list_data_dict[i]))
+
             if isinstance(i, int):
                 data_dict = dict(input_ids=data_dict["input_ids"][0], labels=data_dict["labels"][0])
 
             # image exist in the data
             if "image" in self.list_data_dict[i]:
-                if inst_type == "gen":
+                if self.list_data_dict[i]["type"] == "T2I":
                     data_dict["gen_image"] = img_process(
                         images,
                         self.data_args.gen_image_processor,
                         self.data_args.image_aspect_ratio,
                     )
-
-                elif inst_type == "und":
+                    # # === 新增：保存“最终用到的图片”到 data_test/*.jpg ===
+                    # try:
+                    #     save_dir = "data_test"
+                    #     os.makedirs(save_dir, exist_ok=True)
+                    #     save_imgs = _prepare_save_images(
+                    #         images,
+                    #         self.data_args.gen_image_processor,
+                    #         self.data_args.image_aspect_ratio,
+                    #     )
+                    #     base_id = self.list_data_dict[i]["id"] if "id" in self.list_data_dict[i] else f"idx{i}"
+                    #     caption = self.list_data_dict[i].get("txt", "")  # T2I/journeyDB_T2I 通常有 txt
+                    #     image_path = self.list_data_dict[i]['image_path'] if self.list_data_dict[i]['image_path'] else ""
+                    #     # 若想与 pad 匹配背景色：
+                    #     bg = tuple(int(x * 255) for x in self.data_args.gen_image_processor.image_mean)
+                    #     for k, pil in enumerate(save_imgs):
+                    #         final = _render_caption_below(pil, caption, font_size=20, padding=16,
+                    #                                     text_color=(0, 0, 0), bg_color=bg)
+                    #         out_path = os.path.join(save_dir, f"src_{Path(image_path).name}_id_{base_id}_gen_{k}_cap_{safe_stub(caption, 80)} ... <trunc>.jpg")
+                    #         final.save(out_path, format="JPEG")
+                    # except Exception as e:
+                    #     print(f"[debug][save] gen save failed: {e}")
+                elif self.list_data_dict[i]["type"] == "I2T":
 
                     resized_images = [transform_und_images(img) for img in images]
 
@@ -754,7 +1242,211 @@ class LazySupervisedMixDataset(Dataset):
                         self.data_args.gen_image_processor,
                         self.data_args.image_aspect_ratio,
                     )
+                elif self.list_data_dict[i]["type"] == "TI2I" or self.list_data_dict[i]["type"] == "TII2I":
 
+                    resized_images = [transform_und_images(img) for img in images]
+                    image_inputs = self.data_args.image_processor(resized_images, return_tensors="pt")
+
+                    data_dict["und_image"] = image_inputs.pixel_values
+                    data_dict["grid_thw"] = image_inputs.image_grid_thw
+
+                    resized_output_images = [transform_und_images(img) for img in output_images]
+                    data_dict["gen_image"] = img_process(
+                        resized_output_images,
+                        self.data_args.gen_image_processor,
+                        self.data_args.image_aspect_ratio,
+                    )
+                    # === 新增：保存 und_image + gen_image + instruction 为一张图片 ===
+                    if False:
+                        try:
+                            base_id = self.list_data_dict[i]["id"] if "id" in self.list_data_dict[i] else f"idx{i}"
+                            instruction = json_info.get("instruction", "")
+                            # 与 pad 背景色一致
+                            bg = tuple(int(x * 255) for x in self.data_args.gen_image_processor.image_mean)
+                            gap = 16  # 横向间距
+
+                            env_dir = (os.environ.get("SAVE_DIR") or "data_test")
+                            save_dir = os.path.abspath(os.path.expanduser(os.path.expandvars(env_dir)))
+                            os.makedirs(save_dir, exist_ok=True)
+
+                            # 与示例一致的准备函数，得到可直接保存的 PIL 图像
+                            und_pils = _prepare_save_images(
+                                resized_images,
+                                self.data_args.gen_image_processor,
+                                self.data_args.image_aspect_ratio,
+                            )
+                            gen_pils = _prepare_save_images(
+                                resized_output_images,
+                                self.data_args.gen_image_processor,
+                                self.data_args.image_aspect_ratio,
+                            )
+
+                            # --- 通用 k-und 对 1-gen 的分组逻辑 ---
+                            if len(gen_pils) > 0 and len(und_pils) >= len(gen_pils) and (len(und_pils) % len(gen_pils) == 0):
+                                und_per_gen = len(und_pils) // len(gen_pils)  # 任意 k>=1
+                                for j, g in enumerate(gen_pils):
+                                    und_group = und_pils[j * und_per_gen : (j + 1) * und_per_gen]
+
+                                    # 先把该组多张 und 对齐高度并横向拼成一个块
+                                    if len(und_group) == 1:
+                                        u_block = und_group[0]
+                                    else:
+                                        u_block = _hstack_align_height(und_group, gap, bg)
+
+                                    # 与 gen 对齐高度后再横向拼
+                                    H = max(u_block.height, g.height)
+                                    if u_block.height != H:
+                                        u_block = u_block.resize((int(u_block.width * H / u_block.height), H), Image.BICUBIC)
+                                    if g.height != H:
+                                        g = g.resize((int(g.width * H / g.height), H), Image.BICUBIC)
+
+                                    combo = Image.new("RGB", (u_block.width + gap + g.width, H), bg)
+                                    combo.paste(u_block, (0, 0))
+                                    combo.paste(g, (u_block.width + gap, 0))
+
+                                    final = _render_caption_below(
+                                        combo, instruction, font_size=20, padding=16,
+                                        text_color=(0, 0, 0), bg_color=bg
+                                    )
+                                    out_path = os.path.join(save_dir, f"{base_id}_und{und_per_gen}_gen_{j}.jpg")
+                                    final.save(out_path, format="JPEG")
+
+                            else:
+                                # 退化：无法整分的情况，按索引成对保存
+                                n = min(len(und_pils), len(gen_pils))
+                                for k in range(n):
+                                    u, g = und_pils[k], gen_pils[k]
+
+                                    # 对齐高度后横向拼接
+                                    H = max(u.height, g.height)
+                                    if u.height != H:
+                                        u = u.resize((int(u.width * H / u.height), H), Image.BICUBIC)
+                                    if g.height != H:
+                                        g = g.resize((int(g.width * H / g.height), H), Image.BICUBIC)
+
+                                    combo = Image.new("RGB", (u.width + gap + g.width, H), bg)
+                                    combo.paste(u, (0, 0))
+                                    combo.paste(g, (u.width + gap, 0))
+
+                                    final = _render_caption_below(
+                                        combo, instruction, font_size=20, padding=16,
+                                        text_color=(0, 0, 0), bg_color=bg
+                                    )
+                                    out_path = os.path.join(save_dir, f"{base_id}_und_gen_{k}.jpg")
+                                    final.save(out_path, format="JPEG")
+                        except Exception as e:
+                            print(f"[debug][save-cmp] failed: {e}")
+                    # === 保存 und_image 为一张图、gen_image 为一张图，instruction 到 json（key=und图文件名）===
+                    if False:
+                        try:
+                            base_id = self.list_data_dict[i].get("id", f"idx{i}")
+                            instruction = json_info.get("instruction", "")
+
+                            # 与 pad 背景一致
+                            bg = tuple(int(x * 255) for x in self.data_args.gen_image_processor.image_mean)
+                            gap = 16
+
+                            env_dir = (os.environ.get("SAVE_DIR") or "data_test")
+                            save_dir = os.path.abspath(os.path.expanduser(os.path.expandvars(env_dir)))
+                            os.makedirs(save_dir, exist_ok=True)
+
+                            # 准备 PIL 图像
+                            und_pils = _prepare_save_images(
+                                resized_images,
+                                self.data_args.gen_image_processor,
+                                self.data_args.image_aspect_ratio,
+                            )
+                            gen_pils = _prepare_save_images(
+                                resized_output_images,
+                                self.data_args.gen_image_processor,
+                                self.data_args.image_aspect_ratio,
+                            )
+
+                            # —— 合成“一张 und” ——
+                            if len(und_pils) == 0:
+                                und_img = Image.new("RGB", (512, 512), bg)
+                            elif len(und_pils) == 1:
+                                und_img = und_pils[0]
+                            else:
+                                # 按高度对齐后横向拼成一张
+                                und_img = _hstack_align_height(und_pils, gap, bg)
+
+                            # —— 合成“一张 gen” ——
+                            if len(gen_pils) == 0:
+                                gen_img = Image.new("RGB", (512, 512), bg)
+                            elif len(gen_pils) == 1:
+                                gen_img = gen_pils[0]
+                            else:
+                                gen_img = _hstack_align_height(gen_pils, gap, bg)
+
+                            # 保存图片
+                            und_path = os.path.join(save_dir, f"{base_id}_und.jpg")
+                            gen_path = os.path.join(save_dir, f"{base_id}_gen.jpg")
+                            und_img.save(und_path, format="JPEG")
+                            gen_img.save(gen_path, format="JPEG")
+
+                            # 保存 instruction 到 JSON：{ und文件名: instruction }
+                            mapping = {os.path.basename(und_path): instruction}
+                            json_path = os.path.join(save_dir, f"{base_id}.json")
+                            with open(json_path, "w", encoding="utf-8") as f:
+                                json.dump(mapping, f, ensure_ascii=False, indent=2)
+
+                        except Exception as e:
+                            print(f"[debug][save-simple] failed: {e}")
+                elif self.list_data_dict[i]["type"] == "I2I":
+                    resized_images = [transform_und_images(img) for img in images]
+                    image_inputs = self.data_args.image_processor(resized_images, return_tensors="pt")
+
+                    data_dict["und_image"] = image_inputs.pixel_values
+                    data_dict["grid_thw"] = image_inputs.image_grid_thw
+
+                    data_dict["gen_image"] = img_process(
+                        resized_images,
+                        self.data_args.gen_image_processor,
+                        self.data_args.image_aspect_ratio,
+                    )
+                    # === 保存 und_image 为一张图、gen_image 为一张图，instruction 到 json（key=und图文件名）===
+                    if False:
+                        try:
+                            base_id = self.list_data_dict[i].get("id", f"idx{i}")
+                            instruction = json_info.get("instruction", "")
+
+                            # 与 pad 背景一致
+                            bg = tuple(int(x * 255) for x in self.data_args.gen_image_processor.image_mean)
+                            gap = 16
+
+                            env_dir = (os.environ.get("SAVE_DIR") or "data_test")
+                            save_dir = os.path.abspath(os.path.expanduser(os.path.expandvars(env_dir)))
+                            os.makedirs(save_dir, exist_ok=True)
+
+                            # 准备 PIL 图像
+                            und_pils = _prepare_save_images(
+                                resized_images,
+                                self.data_args.gen_image_processor,
+                                self.data_args.image_aspect_ratio,
+                            )
+                            # —— 合成“一张 und” ——
+                            if len(und_pils) == 0:
+                                und_img = Image.new("RGB", (512, 512), bg)
+                            elif len(und_pils) == 1:
+                                und_img = und_pils[0]
+                            else:
+                                # 按高度对齐后横向拼成一张
+                                und_img = _hstack_align_height(und_pils, gap, bg)
+
+                            # 保存图片
+                            und_path = os.path.join(save_dir, f"{base_id}_und.jpg")
+                            und_img.save(und_path, format="JPEG")
+
+                            # 保存 instruction 到 JSON：{ und文件名: instruction }
+                            mapping = {os.path.basename(und_path): instruction}
+                            json_path = os.path.join(save_dir, f"{base_id}.json")
+                            with open(json_path, "w", encoding="utf-8") as f:
+                                json.dump(mapping, f, ensure_ascii=False, indent=2)
+
+                        except Exception as e:
+                            print(f"[debug][save-simple] failed: {e}")
+                
             elif self.data_args.is_multimodal:
                 crop_size = self.data_args.image_processor.crop_size
                 data_dict["image"] = torch.zeros(3, crop_size["height"], crop_size["width"])
@@ -828,8 +1520,35 @@ class DataCollatorForSupervisedDataset(object):
 
         # print(f"batch_und_images {batch_und_images}")
         if len(batch_und_images) > 0:
-            batch["und_image"] = torch.cat([images for images in batch_und_images], dim=0)
-            batch["grid_thw"] = torch.cat([images for images in batch_grid_thw], dim=0)
+            if all(x is not None and y.shape == batch_und_images[0][0].shape for x in batch_und_images for y in x):
+                batch["und_image"] = torch.cat([images for images in batch_und_images], dim=0)
+                batch["grid_thw"] = torch.cat([images for images in batch_grid_thw], dim=0)
+            else:
+                # 1) 串接视觉输入
+                pv_list  = [instance["und_image"]    for instance in instances]        # ragged: [V_i, 1176]
+                thw_list = [instance["grid_thw"]  for instance in instances]        # ragged: [M_i, 3]
+                pixel_values   = torch.cat(pv_list,  dim=0)               # [sum_V, 1176]
+                image_grid_thw = torch.cat(thw_list, dim=0)               # [sum_M, 3]
+                # 2) 计算“每张图”的 patch 数，并做累计和 → patch_offsets
+                n_per_image = (image_grid_thw[:,0] * image_grid_thw[:,1] * image_grid_thw[:,2]).to(torch.long)  # [sum_M]
+                patch_offsets = torch.cat([torch.zeros(1, dtype=torch.long, device=n_per_image.device),
+                                        torch.cumsum(n_per_image, dim=0)])                                    # [sum_M+1]
+
+                # 3) 每个样本的图片数 M_i、样本层面的 offsets
+                Ms = [thw.shape[0] for thw in thw_list]                                                        # list of M_i
+                sample_image_offsets = torch.tensor([0] + list(itertools.accumulate(Ms)), dtype=torch.long)    # [B+1]
+
+                # 4) 每张图属于哪个样本（方便回收/聚合）
+                image2sample = torch.cat([torch.full((m,), i, dtype=torch.long) for i, m in enumerate(Ms)])    # [sum_M]
+
+                # 5) 其他文本/labels按你原本的逻辑组装即可（通常是常规 pad/stack）
+                batch["und_image"] = pixel_values               # => 直接喂给 Qwen2_5_VLModel
+                batch["grid_thw"] = image_grid_thw           # => 直接喂给 Qwen2_5_VLModel
+
+                # 辅助索引（模型前向不需要，但你还原/对齐时会用到）
+                batch["patch_offsets"] = patch_offsets           # 逐图在 pixel_values 中的切分点
+                batch["sample_image_offsets"] = sample_image_offsets
+                batch["image2sample"] = image2sample
         else:
             batch["und_image"] = None
             batch["grid_thw"] = None
@@ -1004,8 +1723,11 @@ def train(attn_implementation=None):
         model=model,
         tokenizer=tokenizer,
         args=training_args,
+        callbacks=[StdoutLogCallback(tz="Asia/Taipei")],
         **data_module,
     )
+    trainer.remove_callback(PrinterCallback)
+    
     from tabulate import tabulate
 
     if trainer.is_world_process_zero():
@@ -1014,6 +1736,7 @@ def train(attn_implementation=None):
             stat.append([i, n, p.shape, p.requires_grad])
         print(tabulate(stat, headers=["idx", "name", "shape", "trainable"]))
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
+        print("Checkpoint found, resuming training.")
         trainer.train(resume_from_checkpoint=True)
     else:
         trainer.train()

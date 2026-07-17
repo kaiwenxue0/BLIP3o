@@ -1,8 +1,10 @@
-dataset_path: /home/notebook/code/group/xuekaiwen/data/lmms-lab/SEED-Bench
+dataset_path: /home/notebook/code/group/xuekaiwen/data/lmms-lab/LMMs-Eval-Lite
+dataset_name: seedbench
 dataset_kwargs:
   token: True
-task: "seedbench"
-test_split: test
+task: "seedbench_fast200"
+test_split: lite
+process_docs: !function utils.seed_process_docs_fast200
 output_type: generate_until
 doc_to_visual: !function utils.seed_doc_to_visual
 doc_to_text: !function utils.seed_doc_to_text
@@ -10,10 +12,9 @@ doc_to_target: "answer"
 generation_kwargs:
   until:
     - "ASSISTANT:"
+  max_new_tokens: 8
   image_aspect_ratio: original
-# The return value of process_results will be used by metrics
 process_results: !function utils.seed_process_result
-# Note that the metric name can be either a registed metric function (such as the case for GQA) or a key name returned by process_results
 metric_list:
   - metric: seed_image
     aggregation: !function utils.seed_aggregation_result

@@ -9,9 +9,17 @@ from transformers.trainer import (
     is_sagemaker_mp_enabled,
     get_parameter_names,
     has_length,
-    ALL_LAYERNORM_LAYERS,
     logger,
 )
+try:
+    from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
+except Exception:
+    from torch import nn
+    ALL_LAYERNORM_LAYERS = [getattr(nn, 'LayerNorm', None)]
+    if hasattr(nn, 'RMSNorm'):
+        ALL_LAYERNORM_LAYERS.append(nn.RMSNorm)
+    ALL_LAYERNORM_LAYERS = [x for x in ALL_LAYERNORM_LAYERS if x is not None]
+
 from typing import List, Optional
 from transformers.utils import is_torch_xla_available
 

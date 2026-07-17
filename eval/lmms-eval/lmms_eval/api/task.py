@@ -31,6 +31,7 @@ import numpy as np
 from accelerate import Accelerator
 from datasets import Audio, DownloadConfig, Image, Sequence
 from huggingface_hub import snapshot_download
+from huggingface_hub.errors import LocalTokenNotFoundError
 from loguru import logger as eval_logger
 from PIL import ImageFile
 from tenacity import retry, stop_after_attempt, stop_after_delay, wait_fixed
@@ -1041,13 +1042,61 @@ class ConfigurableTask(Task):
             # `ds = load_datasets("lmms-lab/MMMU")`
             self.dataset = datasets.load_from_disk(dataset_path=self.DATASET_PATH)
         else:
-            self.dataset = datasets.load_dataset(
+            effective_dataset_kwargs = copy.deepcopy(dataset_kwargs) if dataset_kwargs is not None else {}
+            load_dataset_kwargs = dict(
                 path=self.DATASET_PATH,
                 name=self.DATASET_NAME,
                 download_mode=datasets.DownloadMode.REUSE_DATASET_IF_EXISTS,
                 download_config=download_config,
-                **dataset_kwargs if dataset_kwargs is not None else {},
             )
+            def _cleanup_incomplete_dataset_cache(exc: FileNotFoundError) -> list[str]:
+                removed_dirs = []
+                candidate_dirs = []
+                if getattr(exc, "filename", None) and ".incomplete" in str(exc.filename):
+                    candidate_dirs.append(os.path.dirname(str(exc.filename)))
+                dataset_cache_root = os.path.join(os.path.expanduser("~/.cache/huggingface/datasets"), str(self.DATASET_PATH).replace("/", "___"))
+                if os.path.isdir(dataset_cache_root):
+                    candidate_dirs.extend(glob(os.path.join(dataset_cache_root, "**", "*.incomplete"), recursive=True))
+                seen = set()
+                for candidate in candidate_dirs:
+                    if not candidate or candidate in seen or not os.path.isdir(candidate):
+                        continue
+                    seen.add(candidate)
+                    shutil.rmtree(candidate, ignore_errors=True)
+                    removed_dirs.append(candidate)
+                return removed_dirs
+
+            def _load_dataset_once(current_dataset_kwargs):
+                return datasets.load_dataset(
+                    **load_dataset_kwargs,
+                    **current_dataset_kwargs,
+                )
+
+            def _load_dataset_with_fallbacks(current_dataset_kwargs):
+                try:
+                    return _load_dataset_once(current_dataset_kwargs)
+                except LocalTokenNotFoundError:
+                    if current_dataset_kwargs.get("token", None) is not True:
+                        raise
+                    retry_dataset_kwargs = copy.deepcopy(current_dataset_kwargs)
+                    retry_dataset_kwargs.pop("token", None)
+                    eval_logger.warning(
+                        "Task requested `token=True` for dataset download but no local Hugging Face token was found. "
+                        f"Retrying anonymous download for dataset_path={self.DATASET_PATH!r}, dataset_name={self.DATASET_NAME!r}."
+                    )
+                    return _load_dataset_with_fallbacks(retry_dataset_kwargs)
+                except FileNotFoundError as exc:
+                    removed_dirs = _cleanup_incomplete_dataset_cache(exc)
+                    if not removed_dirs:
+                        raise
+                    eval_logger.warning(
+                        "Encountered an incomplete Hugging Face dataset cache entry while loading "
+                        f"dataset_path={self.DATASET_PATH!r}, dataset_name={self.DATASET_NAME!r}. "
+                        f"Removed {len(removed_dirs)} incomplete cache director{'y' if len(removed_dirs) == 1 else 'ies'} and retrying."
+                    )
+                    return _load_dataset_with_fallbacks(current_dataset_kwargs)
+
+            self.dataset = _load_dataset_with_fallbacks(effective_dataset_kwargs)
 
         if self.config.process_docs is not None:
             for split in self.dataset:

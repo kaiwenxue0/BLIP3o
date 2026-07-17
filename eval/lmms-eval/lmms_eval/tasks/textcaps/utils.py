@@ -1,10 +1,15 @@
 import json
 import os
+import re
+from io import BytesIO
+from pathlib import Path
 
+import requests
 from loguru import logger as eval_logger
 from pycocoevalcap.eval import Bleu, Cider, COCOEvalCap, Meteor, Rouge, Spice
 from pycocoevalcap.tokenizer.ptbtokenizer import PTBTokenizer
 from pycocotools.coco import COCO
+from PIL import Image
 
 from lmms_eval.tasks._task_utils.file_utils import generate_submission_file
 
@@ -13,8 +18,50 @@ dir_name = os.path.dirname(os.path.abspath(__file__))
 TEXTCAPS_METRICS = ["Bleu_4", "Bleu_3", "Bleu_2", "Bleu_1", "METEOR", "ROUGE_L", "CIDEr"]  # , "SPICE"]
 
 
+def _http_get_noenv(url: str, timeout: int = 30) -> bytes:
+    session = requests.Session()
+    session.trust_env = False
+    response = session.get(url, timeout=timeout)
+    response.raise_for_status()
+    return response.content
+
+
+def _load_visual_from_doc(doc):
+    if "image" in doc and doc["image"] is not None:
+        return doc["image"].convert("RGB")
+
+    filepath = doc.get("filepath") or doc.get("image_path")
+    if filepath:
+        candidate = Path(str(filepath)).expanduser()
+        if candidate.exists():
+            return Image.open(candidate).convert("RGB")
+
+    image_url = doc.get("url") or doc.get("image_url")
+    if image_url:
+        return Image.open(BytesIO(_http_get_noenv(image_url, timeout=30))).convert("RGB")
+
+    raise KeyError(f"Could not resolve image payload from TextCaps doc keys={sorted(doc.keys())}")
+
+
+def _simple_tokenize_caption(text: str) -> str:
+    lowered = str(text).lower().replace("\n", " ")
+    return " ".join(re.findall(r"[a-z0-9]+(?:'[a-z0-9]+)?", lowered))
+
+
+def _tokenize_captions(captions_for_image):
+    try:
+        tokenizer = PTBTokenizer()
+        return tokenizer.tokenize(captions_for_image)
+    except (FileNotFoundError, OSError) as exc:
+        eval_logger.warning(f"PTBTokenizer unavailable ({exc}). Falling back to simple Python tokenization.")
+        tokenized = {}
+        for image_id, captions in captions_for_image.items():
+            tokenized[image_id] = [_simple_tokenize_caption(caption["caption"]) for caption in captions]
+        return tokenized
+
+
 def textcaps_doc_to_visual(doc):
-    return [doc["image"].convert("RGB")]
+    return [_load_visual_from_doc(doc)]
 
 
 def textcaps_doc_to_text(doc, lmms_eval_specific_kwargs=None):
@@ -71,9 +118,8 @@ def textcaps_aggregation_result(results, metric, args=None):
         res[imgId] = textcaps_eval.cocoRes.imgToAnns[imgId]
 
     eval_logger.info("tokenization...")
-    tokenizer = PTBTokenizer()
-    gts = tokenizer.tokenize(gts)
-    res = tokenizer.tokenize(res)
+    gts = _tokenize_captions(gts)
+    res = _tokenize_captions(res)
 
     eval_logger.info(f"Computing {metric} scores...")
 

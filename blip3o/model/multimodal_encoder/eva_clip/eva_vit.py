@@ -9,8 +9,8 @@ from einops import rearrange, repeat
 import logging
 
 from huggingface_hub import snapshot_download
-cache_dir = snapshot_download(repo_id="jiuhai/eva_clip_vision_tower")
-
+# cache_dir = snapshot_download(repo_id="jiuhai/eva_clip_vision_tower")
+cache_dir = "/home/notebook/code/group/xuekaiwen/data/jiuhai/eva_clip_vision_tower"
 
 
 
@@ -419,7 +419,7 @@ class Block(nn.Module):
                 x = x + self.drop_path(self.gamma_2 * self.norm2(self.mlp(x)))
             else:
                 x = x + self.drop_path(self.gamma_1 * self.attn(self.norm1(x), rel_pos_bias=rel_pos_bias, attn_mask=attn_mask))
-                x = x + self.drop_path(self.gamma_2 * self.mlp(self.norm2(x)))
+                x = x + self.drop_path(self.gamma_2 * self.l(self.norm2(x)))
         return x
 
 

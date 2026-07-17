@@ -1,4 +1,9 @@
 task: vizwiz_vqa_val
+dataset_path: /home/notebook/code/group/xuekaiwen/data/lmms-lab/VizWiz-VQA
+dataset_kwargs:
+  data_files:
+    val: data/val-*
+  verification_mode: no_checks
 test_split: val
 include: _default_template_vqa_yaml
 metric_list:

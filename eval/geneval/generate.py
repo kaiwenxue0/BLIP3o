@@ -22,6 +22,7 @@ import math
 import requests
 import random
 from blip3o.conversation import conv_templates, SeparatorStyle
+from blip3o import conversation as conversation_lib
 
 def set_global_seed(seed=42):
 
@@ -37,6 +38,21 @@ def add_template(prompt):
     conv.append_message(conv.roles[1], None)
     prompt = conv.get_prompt()
     return [prompt]
+
+def add_template_vicuna_v1(prompt):
+    conv = conv_templates['vicuna_v1'].copy()
+    header = f"{conv.system}\n\n"
+    BEGIN_SIGNAL = "### "
+    END_SIGNAL = "\n"
+    conversation = header
+    prompt = BEGIN_SIGNAL + conv.roles[0] + ": " + prompt[0] + END_SIGNAL
+    conversation += prompt
+    prompt = BEGIN_SIGNAL + conv.roles[1] + ": "
+    conversation += prompt
+    conversation += BEGIN_SIGNAL
+    print("conversation:", conversation)
+    return [conversation]
+
 
 torch.set_grad_enabled(False)
 
@@ -115,6 +131,12 @@ def parse_args():
         action="store_true",
         help="skip saving grid",
     )
+    parser.add_argument(
+        "--custom_pipeline",
+        type=str,
+        default='pipeline_llava_gen',
+        help="the pipeline used for generate"
+    )
     parser.add_argument("--index", type=int, default=0, help="Chunk index to process (0-indexed)")
     parser.add_argument("--n_chunks", type=int, default=1, help="Total number of chunks")
     opt = parser.parse_args()
@@ -122,7 +144,8 @@ def parse_args():
 
 def main(opt):
     model_name = opt.model
-    diffusion_path = model_name + "/diffusion-decoder"
+    # diffusion_path = model_name + "/diffusion-decoder"
+    diffusion_path = "/home/notebook/code/group/xuekaiwen/data/BLIP3o/BLIP3o-Model-8B/diffusion-decoder"
 
     outdir = f"{model_name}/geneval_{opt.prompt_template}"
     os.makedirs(outdir, exist_ok=True)
@@ -130,9 +153,10 @@ def main(opt):
     disable_torch_init()
     tokenizer, multi_model, context_len = load_pretrained_model(model_name)
 
+    print("loaded tokenizer: ", tokenizer)
     pipe = DiffusionPipeline.from_pretrained(
         diffusion_path,
-        custom_pipeline="pipeline_llava_gen",
+        custom_pipeline=opt.custom_pipeline,
         torch_dtype=torch.bfloat16,
         use_safetensors=True,
         variant="bf16",
@@ -148,7 +172,6 @@ def main(opt):
     # Load all prompts
     with open('geneval_prompt.jsonl') as fp:
         metadatas = [json.loads(line) for line in fp]
-
     # Split the data into chunks: each instance will process every n_chunks-th entry
     metadatas = metadatas[opt.index::opt.n_chunks]
     print(f"Processing chunk {opt.index} out of {opt.n_chunks} total chunks, {len(metadatas)} samples assigned.")
@@ -162,6 +185,10 @@ def main(opt):
         prompt = [f"Please generate image based on the following caption: {prompt}"]
         if "qwen" in prompt_template:
             prompt = add_template(prompt)
+        elif "vicuna_v1" in prompt_template:
+            prompt = add_template_vicuna_v1(prompt)
+        else:
+            raise NotImplementedError
         print(f"Prompt ({index: >3}/{len(metadatas)}): '{prompt}'")
 
         sample_path = os.path.join(outpath, "samples")

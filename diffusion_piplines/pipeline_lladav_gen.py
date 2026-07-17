@@ -36,8 +36,6 @@ OPENAI_DATASET_MEAN = (0.48145466, 0.4578275, 0.40821073)
 OPENAI_DATASET_STD = (0.26862954, 0.26130258, 0.27577711)
 DEFAULT_IMG_PLACEHOLDER = "<image>"
 
-from transformers import AutoProcessor
-image_processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct").image_processor
 
 
 @dataclass
@@ -196,15 +194,17 @@ class EmuVisualGenerationPipeline(DiffusionPipeline):
                 has_text = True
                 text_prompt += x
             else:
-                has_image = True
-                text_prompt = text_prompt.replace(
-                    "<image>",
-                    "<|vision_start|>" + "<|image_pad|>" * 256 + "<|vision_end|>"
-                )
-                resized_images = x.resize((448, 448))
-                image_inputs = image_processor(resized_images, return_tensors="pt")
-                image_prompt.append(image_inputs.pixel_values)
-                image_grid_thw.append(image_inputs.image_grid_thw)
+                # TODO deal with x is image case(placeholder, transform(), ...)
+                pass
+                # has_image = True
+                # text_prompt = text_prompt.replace(
+                #     "<image>",
+                #     "<|vision_start|>" + "<|image_pad|>" * 256 + "<|vision_end|>"
+                # )
+                # resized_images = x.resize((448, 448))
+                # image_inputs = image_processor(resized_images, return_tensors="pt")
+                # image_prompt.append(image_inputs.pixel_values)
+                # image_grid_thw.append(image_inputs.image_grid_thw)
 
         if len(image_prompt) == 0:
             image_prompt = None
@@ -214,6 +214,7 @@ class EmuVisualGenerationPipeline(DiffusionPipeline):
             image_grid_thw = torch.cat(image_grid_thw, dim=0)
         # breakpoint()
         if has_image and not has_text:
+            # TODO check the implement of blip3oLlavaLLaDAModelLM.encode_image() 
             prompt = self.multimodal_encoder.model.encode_image(image=image_prompt)
             if do_classifier_free_guidance:
                 key = "[NULL_IMAGE]"
@@ -222,7 +223,7 @@ class EmuVisualGenerationPipeline(DiffusionPipeline):
                     self.negative_prompt[key] = self.multimodal_encoder.model.encode_image(image=negative_image)
                 prompt = torch.cat([prompt, self.negative_prompt[key]], dim=0)
         elif has_text and not has_image:
-
+            # TODO check the implement of Blip3olladallavaModelLM.generate_image() 
             prompt = self.multimodal_encoder.generate_image(
                 text=[text_prompt], tokenizer=self.tokenizer
             )

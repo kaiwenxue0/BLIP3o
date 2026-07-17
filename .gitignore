@@ -1,0 +1,8 @@
+__pycache__
+*.egg-info
+*.png
+*.log
+*.pt
+*.csv
+data_test*
+*output_train*

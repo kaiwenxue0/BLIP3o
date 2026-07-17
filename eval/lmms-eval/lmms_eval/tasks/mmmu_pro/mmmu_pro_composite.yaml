@@ -1,5 +1,5 @@
 task: "mmmu_pro_composite"
-dataset_path: MMMU/MMMU_Pro
+dataset_path: /home/notebook/code/group/xuekaiwen/data/MMMU/MMMU_Pro
 dataset_name: composite
 test_split: test
 output_type: generate_until

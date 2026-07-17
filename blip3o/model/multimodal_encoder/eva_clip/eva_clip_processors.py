@@ -56,7 +56,13 @@ class EvaClipImageTrainProcessor(EvaClipImageBaseProcessor):
         else:
             assert isinstance(images, list)
         
-        transformed_images = [self.transform(image).numpy() for image in images]
+        transformed_images = []
+        for idx, img in enumerate(images):
+            arr = self.transform(img).numpy()
+            # # --- DEBUG: 输出侧概览（tensor/list 的形状/范围） ---
+            # print(f"[debug][img] after transform[{idx}] shape={arr.shape}, dtype={arr.dtype}, min={arr.min():.3f}, max={arr.max():.3f}")
+            transformed_images.append(arr)
+
         data = {"pixel_values": transformed_images}
 
 

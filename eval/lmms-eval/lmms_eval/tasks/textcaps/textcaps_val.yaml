@@ -1,6 +1,8 @@
-dataset_path: lmms-lab/TextCaps
+dataset_path: /home/notebook/code/group/xuekaiwen/data/lmms-lab/TextCaps
 dataset_kwargs:
-  token: True
+  data_files:
+    val: data/val-*
+  verification_mode: no_checks
 task: "textcaps_val"
 group : "textcaps_caption"
 test_split: val
